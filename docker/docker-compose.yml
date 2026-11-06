@@ -1,0 +1,63 @@
+# 两种形态的参考编排。默认只起 allinone；网关独占形态用 profile 切换。
+#
+#   DEEPSEEK_API_KEY=sk-... docker compose -f docker/docker-compose.yml up -d --build
+#   docker compose -f docker/docker-compose.yml --profile gateway-only up -d
+
+name: dsh
+
+services:
+  # 形态 B：DSH + 网关同容器，一条命令起一个可用的 Agent 服务。
+  allinone:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.allinone
+    image: dsh-allinone:0.4.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"      # 默认只绑回环；对外请走 nginx TLS
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?需要 DEEPSEEK_API_KEY}
+      DSH_GATEWAY_API_KEYS: ${DSH_GATEWAY_API_KEYS:-}
+      # 让 /metrics 可被抓取。DSH_GATEWAY_ADMIN_KEYS 需要网关 >= 0.4.2；
+      # 0.4.1 请改为挂载带 auth.keys[].admin=true 的 config.json。
+      DSH_GATEWAY_ADMIN_KEYS: ${DSH_GATEWAY_ADMIN_KEYS:-}
+      # 容器内若无法建立 bwrap 沙箱，入口会自动回退 landlock 并在日志里说明；
+      # 想强制某一种模式就显式设置：
+      # DSH_PERMISSION_MODE: workspace-write
+    volumes:
+      - dsh-home:/home/dsh/.dsh
+      - dsh-state:/var/lib/dsh-gateway
+      - ./workspace:/workspace
+    # 同时放开 seccomp 与 apparmor 才能让容器内的 bwrap 工作（完整强制）。
+    # 只放开 seccomp 不够：会卡在 AppArmor 对 mount 的拦截。
+    # 不加这两项也能用——DSH 会回退到 landlock（部分强制），边界同样生效。
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+
+  # 形态 A：只跑网关，DSH 在容器外（另一台机器 / 宿主机 / 别的编排）。
+  gateway:
+    profiles: ["gateway-only"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+    image: dsh-gateway:0.4.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8788:8787"
+    environment:
+      DSH_BASE_URL: ${DSH_BASE_URL:-http://host.docker.internal:3080}
+      DSH_TOKEN_FILE: /var/lib/dsh-gateway/dsh-token
+      DSH_GATEWAY_API_KEYS: ${DSH_GATEWAY_API_KEYS:?需要至少一个 key}
+      DSH_GATEWAY_AGENTS: ${DSH_GATEWAY_AGENTS:-[{"id":"assistant","preset":"standard","cwd":"/srv/dsh/tenants/acme"}]}
+      DSH_GATEWAY_DEFAULT_MODEL: ${DSH_GATEWAY_DEFAULT_MODEL:-}
+    volumes:
+      # 只读挂载宿主上 DSH 生成令牌的目录。
+      # 注意：镜像以 uid 1000 运行，令牌文件必须对 uid 1000 可读（chown 1000:1000 或 chmod 640 + 同组）。
+      - ${DSH_STATE_DIR:-/var/lib/dsh-gateway}:/var/lib/dsh-gateway:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  dsh-home:
+  dsh-state:

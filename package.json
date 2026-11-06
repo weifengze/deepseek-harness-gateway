@@ -1,0 +1,55 @@
+{
+  "name": "deepseek-harness-gateway",
+  "version": "0.4.2",
+  "description": "HTTP API for DeepSeek Harness: install as a dsh plugin bundle or run standalone, then call your configured agents through agents / sessions / messages / runs, with SSE streaming, raw event passthrough, async runs, per-key metering and tenant isolation.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "dsh-gateway": "./src/index.mjs"
+  },
+  "exports": {
+    "./client": "./src/dsh-client.mjs",
+    "./plugin": "./src/plugin.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "src/",
+    "scripts/smoke.mjs",
+    "docs/",
+    "docker/",
+    "config.example.json",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/index.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "check": "node --check src/index.mjs && node --check src/config.mjs && node --check src/cordis-client.mjs && node --check src/dsh-client.mjs && node --check src/errors.mjs && node --check src/metrics.mjs && node --check src/plugin.mjs && node --check src/runner.mjs && node --check src/server.mjs && node --check src/sessions.mjs && node --check src/supervisor.mjs && node --check src/usage.mjs && node --check scripts/smoke.mjs",
+    "prepublishOnly": "npm run check"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "gateway",
+    "agent",
+    "agent-api",
+    "sessions",
+    "sse",
+    "llm",
+    "api-gateway"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

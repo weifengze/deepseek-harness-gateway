@@ -1,0 +1,10 @@
+# 构建上下文只需要 docker/ 与仓库根的几个文件；其余一律不进上下文。
+node_modules
+data
+*.tgz
+.git
+.gitignore
+.workbuddy
+docs
+config.json
+package-lock.json

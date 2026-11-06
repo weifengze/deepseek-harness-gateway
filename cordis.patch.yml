@@ -1,0 +1,39 @@
+# dsh-api-gateway —— DSH 组合层（bundle）
+#
+# package.json 的 dsh.bundle.patch 指向本文件；`dsh plugin add dsh-api-gateway` 会把它
+# 登记为 profile 的一个 bundle 层，由 profile 的 dsh.profile.bundles 顺序装载。
+#
+# 这一层只做一件事：在宿主进程内挂载网关的 HTTP 服务。
+# 网关直接调用 ctx.sessionController / ctx.agentPresets，不经过 /connect，
+# 因此不需要 dsh.baseUrl，也不需要启动令牌。
+#
+# ★ config 与 config.json 同构，常用项：
+#     server.host / server.port        监听地址（默认 127.0.0.1:8787）
+#     auth.keys[]                      对外 API key；缺省时启动生成一次性 key 并打印
+#     apps[]                           对外应用；缺省时按宿主已注册预设自动展开
+#     models.default                   部署级兜底模型
+#     storage.conversationsFile        会话归属档案（建议写绝对路径）
+#
+# ★ 端口冲突：宿主启动时若 8787 被占用，本行会激活失败并让 dsh 报错。
+#   同一台机器上既跑网关 CLI 又装插件时，请改这里的 port。
+
+- insert:
+    - id: dsh-api-gateway
+      name: './src/plugin.mjs'
+      config:
+        server:
+          host: 127.0.0.1
+          port: 8787
+        # auth:
+        #   keys:
+        #     - id: default
+        #       secret: 替换成至少 16 位的强随机串
+        #       apps: ['*']
+        # apps:
+        #   - id: assistant
+        #     preset: standard
+        # models:
+        #   default: { provider: deepseek-official, model: deepseek-flash, reasoningEffort: max }
+        # storage:
+        #   conversationsFile: E:/dsh-api-gateway-data/conversations.json
+        #   usageFile: E:/dsh-api-gateway-data/usage.json

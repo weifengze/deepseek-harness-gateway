@@ -1,0 +1,354 @@
+/**
+ * DSH Host 适配层。
+ *
+ * 只做三件 DSH 自己已经定义好的事：
+ *   1. GET /connect?token=... 换取签名 API Cookie（owner 级 Peer）；
+ *   2. POST /api/<namespace>/<method> 发送 client-request 信封，取 server-response；
+ *   3. WS /api/remote.mux 打开 Remote 流（session/follow、assistant-stream 增量）。
+ *
+ * 这一层刻意不认识任何业务语义，只把 wire 细节收敛在文件内。
+ */
+
+/** DSH 返回的结构化失败（RemoteError 的 wire 形态）。 */
+export class DshError extends Error {
+  constructor(code, message, details = {}) {
+    super(message)
+    this.name = 'DshError'
+    this.code = code
+    this.details = details
+  }
+}
+
+/** 传输层失败：DNS、连接被拒、超时、进程重启等。 */
+export class DshTransportError extends Error {
+  constructor(message, cause) {
+    super(message)
+    this.name = 'DshTransportError'
+    this.cause = cause
+  }
+}
+
+/** 简单的异步队列，把 WS 帧转成 for-await 可消费的流。 */
+export class AsyncQueue {
+  #items = []
+  #waiters = []
+  #done = false
+  #failure
+
+  push(value) {
+    if (this.#done) return
+    const waiter = this.#waiters.shift()
+    if (waiter) waiter.resolve({ value, done: false })
+    else this.#items.push(value)
+  }
+
+  end() {
+    if (this.#done) return
+    this.#done = true
+    for (const waiter of this.#waiters.splice(0)) waiter.resolve({ value: undefined, done: true })
+  }
+
+  fail(error) {
+    if (this.#done) return
+    this.#failure = error
+    this.#done = true
+    for (const waiter of this.#waiters.splice(0)) waiter.reject(error)
+  }
+
+  next() {
+    if (this.#items.length > 0) return Promise.resolve({ value: this.#items.shift(), done: false })
+    if (this.#failure) return Promise.reject(this.#failure)
+    if (this.#done) return Promise.resolve({ value: undefined, done: true })
+    return new Promise((resolve, reject) => {
+      this.#waiters.push({ resolve, reject })
+    })
+  }
+
+  [Symbol.asyncIterator]() {
+    return { next: () => this.next() }
+  }
+}
+
+/** 一个已打开的 Remote 流。close() 等价于向上游发送 cancel。 */
+export class RemoteStream {
+  #queue = new AsyncQueue()
+  #close
+
+  constructor(close) {
+    this.#close = close
+  }
+
+  get queue() {
+    return this.#queue
+  }
+
+  /** 关闭流。幂等；重复调用只发一次 cancel。 */
+  close() {
+    this.#close()
+  }
+}
+
+const CONNECT_PATH = '/connect'
+const MUX_PATH = '/api/remote.mux'
+
+/** 把 http(s) 基址换成 ws(s) 基址。 */
+function toWsBase(baseUrl) {
+  const url = new URL(baseUrl)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  return url
+}
+
+/** 从 Set-Cookie 头里挑出 DSH 的认证 Cookie（name 由 authority 派生，不做硬编码）。 */
+function pickSessionCookie(headers) {
+  const list = typeof headers.getSetCookie === 'function'
+    ? headers.getSetCookie()
+    : [headers.get('set-cookie')].filter(Boolean)
+  for (const entry of list) {
+    const pair = entry.split(';', 1)[0]
+    const index = pair.indexOf('=')
+    if (index > 0) return { name: pair.slice(0, index), value: pair.slice(index + 1) }
+  }
+  return undefined
+}
+
+export class DshClient {
+  #baseUrl
+  #getToken
+  #cookie
+  #authInFlight
+  #ws
+  #wsOpening
+  #streams = new Map()
+  #counter = 0
+  #log
+
+  /**
+   * @param {object} options
+   * @param {string} options.baseUrl DSH web 监听地址，如 http://127.0.0.1:3080
+   * @param {string} [options.token] 固定令牌（与 getToken 二选一）
+   * @param {() => Promise<string | undefined>} [options.getToken] 每次握手重新解析令牌，支持文件热更新
+   * @param {(level: string, message: string, extra?: object) => void} [options.log]
+   */
+  constructor({ baseUrl, token, getToken, log }) {
+    this.#baseUrl = (baseUrl ?? '').replace(/\/+$/, '')
+    this.#getToken = getToken ?? (async () => token)
+    this.#log = log ?? (() => {})
+  }
+
+  get baseUrl() {
+    return this.#baseUrl
+  }
+
+  /** 托管模式下 dsh 重启可能换端口/令牌。 */
+  setBaseUrl(baseUrl) {
+    this.#baseUrl = baseUrl.replace(/\/+$/, '')
+    this.#cookie = undefined
+  }
+
+  /** 运行时替换令牌（网关自己拉起 dsh 时，重启会换 token）。 */
+  setToken(token) {
+    this.#getToken = async () => token
+    this.#cookie = undefined
+  }
+
+  /** 丢弃当前凭据，下次调用重新握手。 */
+  invalidate() {
+    this.#cookie = undefined
+  }
+
+  async #authenticate() {
+    if (this.#cookie) return this.#cookie
+    if (this.#authInFlight) return this.#authInFlight
+    this.#authInFlight = (async () => {
+      const token = await this.#getToken()
+      if (!token) {
+        throw new DshTransportError(
+          '缺少 DSH 访问令牌：设置 DSH_API_TOKEN（或 DSH_TOKEN / dsh.tokenFile / dsh.token）',
+        )
+      }
+      const url = new URL(`${this.#baseUrl}${CONNECT_PATH}`)
+      url.searchParams.set('token', token)
+      // 外部调用方不具备“替人回答”的交互能力，固定 none。
+      url.searchParams.set('interactions', 'none')
+      let response
+      try {
+        response = await fetch(url, { redirect: 'manual' })
+      } catch (error) {
+        throw new DshTransportError(`connect 失败: ${error.message}`, error)
+      }
+      if (response.status !== 302) {
+        const body = await response.text().catch(() => '')
+        throw new DshTransportError(`connect 被拒绝: HTTP ${response.status} ${body.slice(0, 200)}`)
+      }
+      const cookie = pickSessionCookie(response.headers)
+      if (!cookie) throw new DshTransportError('connect 未返回认证 Cookie')
+      this.#cookie = `${cookie.name}=${cookie.value}`
+      this.#log('info', 'dsh: 已换取 API Cookie')
+      return this.#cookie
+    })().finally(() => {
+      this.#authInFlight = undefined
+    })
+    return this.#authInFlight
+  }
+
+  /**
+   * 调用一个一元 Remote 方法。
+   * @param {string} endpoint `<namespace>/<method>`，如 session/prompt
+   * @param {object} args 具名参数对象，字段必须与 DSH 描述符完全一致
+   * @param {object} [options]
+   * @param {AbortSignal} [options.signal]
+   * @param {number} [options.timeoutMs]
+   * @returns {Promise<unknown>} 成功值；失败抛 DshError
+   */
+  async call(endpoint, args, { signal, timeoutMs = 60_000 } = {}) {
+    const run = async (retry) => {
+      const cookie = await this.#authenticate()
+      const rpcId = `gw-${process.pid}-${++this.#counter}`
+      const body = JSON.stringify({
+        type: 'client-request',
+        rpcId,
+        method: endpoint,
+        payload: { args },
+      })
+      let response
+      try {
+        response = await fetch(`${this.#baseUrl}/api/${endpoint}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', cookie },
+          body,
+          signal: signal ?? AbortSignal.timeout(timeoutMs),
+        })
+      } catch (error) {
+        if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
+          throw new DshTransportError(`调用 ${endpoint} 超时`, error)
+        }
+        throw new DshTransportError(`调用 ${endpoint} 失败: ${error.message}`, error)
+      }
+      if (response.status === 401 && retry) {
+        this.invalidate()
+        return run(false)
+      }
+      if (!response.ok) {
+        const text = await response.text().catch(() => '')
+        throw new DshTransportError(`调用 ${endpoint} 返回 HTTP ${response.status}: ${text.slice(0, 200)}`)
+      }
+      const envelope = await response.json()
+      const result = envelope?.result
+      if (!result || typeof result.ok !== 'boolean') {
+        throw new DshTransportError(`调用 ${endpoint} 返回了无效信封`)
+      }
+      if (!result.ok) {
+        const error = result.error ?? {}
+        throw new DshError(error.code ?? 'gateway/internal', error.message ?? '未知错误', error.details ?? {})
+      }
+      return result.value
+    }
+    return run(true)
+  }
+
+  async #ensureSocket() {
+    if (this.#ws?.readyState === 1) return this.#ws
+    if (this.#wsOpening) return this.#wsOpening
+
+    this.#wsOpening = (async () => {
+      const cookie = await this.#authenticate()
+      const url = toWsBase(this.#baseUrl)
+      url.pathname = MUX_PATH
+      const socket = new WebSocket(url, { headers: { cookie } })
+      socket.addEventListener('message', (event) => this.#onMessage(String(event.data)))
+      socket.addEventListener('close', () => {
+        const wasOpen = this.#ws === socket
+        this.#ws = undefined
+        if (wasOpen) this.#failAllStreams(new DshTransportError('DSH Remote 流连接已关闭'))
+      })
+      socket.addEventListener('error', () => {
+        // close 会随后触发，错误细节统一由 close 分支上报。
+      })
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new DshTransportError('打开 Remote 流 WebSocket 超时')), 15_000)
+        socket.addEventListener('open', () => {
+          clearTimeout(timer)
+          resolve()
+        }, { once: true })
+        socket.addEventListener('close', (event) => {
+          clearTimeout(timer)
+          reject(new DshTransportError(`打开 Remote 流 WebSocket 失败: code ${event.code}`))
+        }, { once: true })
+      })
+      this.#ws = socket
+      this.#log('info', 'dsh: Remote 流通道已建立')
+      return socket
+    })().finally(() => {
+      this.#wsOpening = undefined
+    })
+    return this.#wsOpening
+  }
+
+  #onMessage(text) {
+    let frame
+    try {
+      frame = JSON.parse(text)
+    } catch {
+      return
+    }
+    const entry = this.#streams.get(frame.streamId)
+    if (!entry) return
+    if (frame.type === 'item') {
+      entry.stream.queue.push(frame.value)
+    } else if (frame.type === 'error') {
+      const error = frame.error ?? {}
+      entry.stream.queue.fail(new DshError(error.code ?? 'gateway/internal', error.message ?? '流失败', error.details ?? {}))
+      this.#streams.delete(frame.streamId)
+    } else if (frame.type === 'end') {
+      entry.stream.queue.end()
+      this.#streams.delete(frame.streamId)
+    }
+  }
+
+  #failAllStreams(error) {
+    for (const [id, entry] of this.#streams) {
+      entry.stream.queue.fail(error)
+      this.#streams.delete(id)
+    }
+  }
+
+  /**
+   * 打开一个 Remote 流。
+   * @param {string} endpoint 如 session/follow
+   * @param {object} args 具名参数
+   * @returns {Promise<RemoteStream>}
+   */
+  async openStream(endpoint, args) {
+    const socket = await this.#ensureSocket()
+    const streamId = `s${++this.#counter}`
+    let closed = false
+    const close = () => {
+      if (closed) return
+      closed = true
+      const entry = this.#streams.get(streamId)
+      if (entry) {
+        this.#streams.delete(streamId)
+        try {
+          if (socket.readyState === 1) socket.send(JSON.stringify({ type: 'cancel', streamId }))
+        } catch {
+          // 连接已断时无需上报：cancel 只是尽力释放上游资源。
+        }
+        entry.stream.queue.end()
+      }
+    }
+    const stream = new RemoteStream(close)
+    this.#streams.set(streamId, { stream, endpoint })
+    socket.send(JSON.stringify({ type: 'open', streamId, endpoint, payload: { args } }))
+    return stream
+  }
+
+  close() {
+    this.#failAllStreams(new DshTransportError('网关正在关闭'))
+    try {
+      this.#ws?.close()
+    } catch {
+      // 关闭阶段的异常不影响退出。
+    }
+    this.#ws = undefined
+  }
+}

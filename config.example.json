@@ -1,0 +1,86 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "maxBodyBytes": 16777216,
+    "runTimeoutMs": 300000,
+    "streamIdleTimeoutMs": 180000,
+    "heartbeatMs": 15000,
+    "accessLog": true
+  },
+  "dsh": {
+    "_comment": "A. sidecar：填 baseUrl，令牌用 DSH_API_TOKEN（或 DSH_TOKEN / dsh.tokenFile）。B. 托管：删掉 baseUrl，改用 spawn。",
+    "baseUrl": "http://127.0.0.1:3080",
+    "tokenFile": "",
+    "spawn": {
+      "command": "node",
+      "args": [
+        "E:/WebStormProjectSpace/deepseek-harness/apps/cli/lib/bin.js",
+        "--profile",
+        "web",
+        "--no-open",
+        "--port",
+        "3080"
+      ],
+      "cwd": "E:/WebStormProjectSpace/deepseek-harness",
+      "startupTimeoutMs": 120000
+    }
+  },
+  "auth": {
+    "keys": [
+      {
+        "id": "demo",
+        "secret": "dsh_demo_key_change_me_0001",
+        "agents": ["assistant", "rrb-supervisor"],
+        "rpm": 60,
+        "maxConcurrentRuns": 2,
+        "tokenQuota": 0
+      }
+    ]
+  },
+  "models": {
+    "_comment": "部署级兜底模型。配置后，未声明 agents[].model 的 agent也会在建会话时被显式固定，新会话不再继承 DSH 默认模型的漂移。留空则沿用 DSH 默认（会被任何 selectModel 改写）。",
+    "default": { "provider": "deepseek-official", "model": "deepseek-flash", "reasoningEffort": "off" }
+  },
+  "agents": [
+    {
+      "id": "assistant",
+      "name": "通用助手",
+      "description": "standard 预设：日常问答与轻量工具调用。",
+      "preset": "standard",
+      "cwd": "E:/dsh-example-repo/dsh-api-gateway"
+    },
+    {
+      "id": "rrb-supervisor",
+      "name": "RRB 会议预案总控",
+      "description": "rrb-supervisor 预设：需求收集 → 历史检索 → 冲突检查 → 报告输出。",
+      "preset": "rrb-supervisor",
+      "cwd": "E:/dsh-example-repo/meeting-dsh-preset-kimi"
+    },
+    {
+      "id": "rrb-research",
+      "name": "RRB 历史检索",
+      "description": "rrb-worker-research 预设：RAGFlow 只读检索与证据登记。",
+      "preset": "rrb-worker-research",
+      "cwd": "E:/dsh-example-repo/meeting-dsh-preset-kimi",
+      "model": { "provider": "deepseek-official", "model": "deepseek-flash", "reasoningEffort": "high" }
+    },
+    {
+      "id": "harness-dev",
+      "name": "Harness 插件开发",
+      "description": "cordis 预设：读写 DSH 仓库、生成插件与组合。",
+      "preset": "cordis",
+      "cwd": "E:/WebStormProjectSpace/deepseek-harness"
+    }
+  ],
+  "limits": {
+    "maxConcurrentRuns": 8,
+    "maxSessionsPerKey": 200,
+    "maxImagesPerRequest": 4,
+    "maxImageBytes": 8388608
+  },
+  "storage": {
+    "conversationsFile": "data/conversations.json",
+    "usageFile": "data/usage.json"
+  }
+}

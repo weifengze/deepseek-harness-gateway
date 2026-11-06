@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1
+#
+# 形态 B：DSH + 网关同容器（一体化）。适合"一台机器就是一个 Agent 服务"的场景。
+#
+#   docker build -f docker/Dockerfile.allinone -t dsh-allinone:0.4.1 .
+#   docker run -d --name dsh \
+#     -p 8787:8787 \
+#     -e DEEPSEEK_API_KEY=sk-... \
+#     -v dsh-home:/home/dsh/.dsh \
+#     -v dsh-state:/var/lib/dsh-gateway \
+#     -v /srv/tenants:/workspace \
+#     dsh-allinone:0.4.1
+#
+# ⚠️ 容器内 bwrap 需要宿主放行 user namespace，否则入口会退化为 danger-full-access
+#    （边界退化为容器本身）。细节见 docs/docker.md。
+
+ARG NODE_IMAGE=node:24-bookworm-slim
+
+FROM ${NODE_IMAGE}
+ARG GATEWAY_VERSION=0.4.1
+ARG DSH_VERSION=0.2.2-rc.1
+
+LABEL org.opencontainers.image.title="dsh-allinone" \
+      org.opencontainers.image.description="DeepSeek Harness + HTTP API gateway in one container" \
+      org.opencontainers.image.version="${GATEWAY_VERSION}" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=8787 \
+    DSH_HOME=/home/dsh/.dsh \
+    STATE_DIR=/var/lib/dsh-gateway \
+    WORKSPACE=/workspace \
+    NODE_OPTIONS=--dns-result-order=ipv4first
+
+# bubblewrap 是 DSH 的沙箱后端；没它 bash/文件工具会 fail closed。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bubblewrap ca-certificates tini \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --no-audit --no-fund \
+      "@deepseek-ai/dsh@${DSH_VERSION}" \
+      "deepseek-harness-gateway@${GATEWAY_VERSION}" \
+ && npm cache clean --force
+
+# 非 root 运行：沙箱探测与文件权限都更可预期。
+# 注意：VOLUME 指向的目录必须**在镜像里就存在且属主正确**，否则 Docker 会建一个
+# root:root 的空匿名卷，运行期 mkdir 直接 Permission denied。
+RUN useradd --create-home --uid 10001 --shell /bin/bash dsh \
+ && mkdir -p /home/dsh/.dsh /var/lib/dsh-gateway /opt/dsh-gateway /workspace \
+ && chown -R dsh:dsh /var/lib/dsh-gateway /opt/dsh-gateway /workspace /home/dsh
+
+COPY docker/entrypoint.sh /usr/local/bin/dsh-entrypoint
+# Windows 检出可能带 CRLF，会让 shebang 变成 "bash\r"。这里强制归一。
+RUN sed -i 's/\r$//' /usr/local/bin/dsh-entrypoint \
+ && chmod 0755 /usr/local/bin/dsh-entrypoint \
+ && head -1 /usr/local/bin/dsh-entrypoint
+
+# 默认配置：只有一个 assistant，工作区 /workspace。
+# auth 不写进文件——由入口从 DSH_GATEWAY_API_KEYS 注入（缺省时生成一次性 key）。
+COPY docker/config.allinone.json /opt/dsh-gateway/config.json
+
+USER dsh
+WORKDIR /home/dsh
+
+EXPOSE 8787
+VOLUME ["/home/dsh/.dsh", "/var/lib/dsh-gateway", "/workspace"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/healthz').then(async r=>{const j=await r.json();process.exit(r.ok&&j.dsh&&j.dsh.reachable?0:1)}).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/dsh-entrypoint"]

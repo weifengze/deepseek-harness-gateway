@@ -1,0 +1,14 @@
+{
+  "server": { "host": "0.0.0.0", "port": 8787, "runTimeoutMs": 300000 },
+  "dsh": { "baseUrl": "http://127.0.0.1:3080" },
+  "models": {
+    "default": { "provider": "deepseek-official", "model": "deepseek-flash", "reasoningEffort": "high" }
+  },
+  "agents": [
+    { "id": "assistant", "preset": "standard", "cwd": "/workspace" }
+  ],
+  "storage": {
+    "conversationsFile": "/var/lib/dsh-gateway/conversations.json",
+    "usageFile": "/var/lib/dsh-gateway/usage.json"
+  }
+}
