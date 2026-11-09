@@ -50,6 +50,10 @@ const DEFAULTS = {
     publicBaseUrl: undefined,
     signingSecret: undefined,
   },
+  questions: {
+    enabled: true,
+    waitMs: 120_000,
+  },
   storage: {
     conversationsFile: 'data/conversations.json',
     usageFile: 'data/usage.json',
@@ -232,6 +236,19 @@ function normalizeFiles(value) {
 }
 
 /**
+ * 提问通道：`enabled:false` 时仍然订阅转发事件流（否则 Host 的 waterfall 会悬挂），
+ * 只是把提问直接放行——工具会以 `NO_PROVIDER` 快速失败。`waitMs` 是调用方填表的窗口。
+ * @param {object} value 已与默认值合并后的 questions 段
+ */
+function normalizeQuestions(value) {
+  const waitMs = requirePositiveInt(value.waitMs, 'questions.waitMs')
+  if (waitMs > 3_600_000) {
+    throw new ConfigError('questions.waitMs 不应超过 3600000（1 小时），超时会把整轮对话一直挂着')
+  }
+  return { enabled: value.enabled !== false, waitMs }
+}
+
+/**
  * 读取并校验配置。
  * @param {string} [configPath] config.json 路径；缺省读 DSH_GATEWAY_CONFIG 或 ./config.json
  * @returns {object} 冻结后的配置
@@ -393,6 +410,14 @@ export function buildConfig(raw = {}, { configPath = 'cordis:plugin', inProcess 
     config.files.enabled = !/^(0|false|no|off)$/i.test(process.env.DSH_GATEWAY_FILES_ENABLED.trim())
   }
   config.files = normalizeFiles(config.files ?? {})
+
+  if (process.env.DSH_GATEWAY_QUESTIONS_ENABLED) {
+    config.questions.enabled = !/^(0|false|no|off)$/i.test(process.env.DSH_GATEWAY_QUESTIONS_ENABLED.trim())
+  }
+  if (process.env.DSH_GATEWAY_QUESTIONS_WAIT_MS) {
+    config.questions.waitMs = Number(process.env.DSH_GATEWAY_QUESTIONS_WAIT_MS)
+  }
+  config.questions = normalizeQuestions(config.questions ?? {})
 
   if (config.dsh.token === '') config.dsh.token = undefined
   if (config.dsh.tokenFile !== undefined && typeof config.dsh.tokenFile !== 'string') {

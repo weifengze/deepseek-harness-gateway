@@ -173,6 +173,7 @@ web 端 71 个 client 包，最终落到 13 个 Remote namespace：
 |---|---|---|
 | 对话、多轮、取消 | `session/create` `prompt` `cancel` `follow` | ✅ `POST /sessions`、`POST /sessions/{id}/messages`、`/cancel` |
 | 工具调用、步骤、审批、反问、子智能体、计划模式 | 都在 `session/follow` 的事件流里 | ✅ `stream:"raw"`（4.6.3）原样转发 |
+| 替人回答 `ask_user_question` | `user-questions/request` 瀑布 + `$events/result` | ✅ `/v1/sessions/{id}/questions`（4.12） |
 | 模型目录、预设清单 | `session/modelCatalog` `agentPresets/list` | ✅ `/v1/models`、`/v1/agents` |
 | 会话历史、投影 | `session/page` `projections` | ✅ `GET /sessions/{id}/messages` |
 | 文件预览 / 工作区文件读 | `workspaceFiles/read` `readBytes` `stat` `list` | ✅ `/v1/sessions/{id}/files`（4.11） |
@@ -228,7 +229,7 @@ flowchart LR
 ### 4.1 `GET /healthz`（免鉴权）
 
 ```json
-{"status":"ok","version":"0.5.0",
+{"status":"ok","version":"0.6.0",
  "dsh":{"reachable":true,"presets":14,"base_url":"cordis:in-process"}}
 ```
 
@@ -430,7 +431,7 @@ snapshot → agent/inbox/spliced → turn/start → step/start → system/messag
 
 `/metrics` 输出 Prometheus 文本：`dsh_gateway_requests_total`、`dsh_gateway_runs_total`、
 `dsh_gateway_run_duration`、`dsh_gateway_tokens_total`、`dsh_gateway_active_runs`、
-`dsh_gateway_files_total`。需要 admin key 或从回环地址访问。
+`dsh_gateway_files_total`、`dsh_gateway_questions_total`。需要 admin key 或从回环地址访问。
 
 ### 4.11 文件：产物清单与下载
 
@@ -461,6 +462,35 @@ Agent 答完往往还产出文件。0.5.0 起，**一轮的返回里带 `files`*
    `files.reader:"auto"` 只在「上游没有这个能力」时降级，业务错误不降级。
 
 完整规则、安全模型与错误码见 [`docs/files.md`](docs/files.md)。
+
+### 4.12 提问表单：替人回答 `ask_user_question`
+
+模型提问时，调用方可以像填表一样把答案提交回去。0.6.0 起支持（**legacy 形态**）：
+
+| 路由 | 说明 |
+|---|---|
+| `GET /v1/sessions/{id}/questions` | 当前在等答案的表单 |
+| `POST /v1/sessions/{id}/questions/{question_id}/answer` | `{answers:[{id,selected,custom?}]}` 或 `{decline:true}` |
+
+`stream:true` 时 SSE 会多出 `question` / `question_closed` 两种帧；`stream:false` 的调用方
+用 `GET /questions` 轮询（会话对象里的 `pending_questions` 可以先探一下）。
+
+```json
+// SSE
+{"type":"question","question_id":"q_3c4e...","questions":[
+  {"id":"q1","question":"选 A 还是 B","header":"确认","options":[{"label":"A"},{"label":"B"}]}],
+ "expires_at":1794197322}
+
+// 提交
+{"answers":[{"id":"q1","selected":["A"]}]}
+```
+
+为什么非做不可：提问走的是**瀑布事件** `user-questions/request`，没人应答时 DSH 不会自己收尾，
+那一轮会一直挂着（实测 150 秒无响应）。网关现在订阅 `$events` 承接它——所以
+`questions.enabled:false` 也不是「关掉通道」，而是「收到就放行」，保证回合能结束。
+
+legacy 的三个后果：答案只在网关进程内存、没有 `callId` 不能事后补交、超过 `questions.waitMs` 按放行处理。
+完整语义、与浏览器界面抢答的竞态、错误码见 [`docs/questions.md`](docs/questions.md)。
 
 ---
 
@@ -796,6 +826,8 @@ DSH_BASE_URL=http://127.0.0.1:3080 DSH_API_TOKEN=xxxx dsh-gateway
 | `limits.maxSessionsPerKey` | 200 | 每 key 会话数 |
 | `files.enabled` | true | 关掉后文件路由返回 404 `files_disabled` |
 | `files.reader` | `auto` | `auto` / `dsh` / `local` |
+| `questions.enabled` | true | false = 收到提问直接放行（仍订阅事件流，避免回合悬挂） |
+| `questions.waitMs` | 120000 | 表单等待上限，最大 3600000 |
 | `files.roots` | `[]` | 除会话 cwd 外额外允许的绝对目录（拒绝整盘） |
 | `files.maxBytes` | 32 MiB | 单文件下载上限 |
 | `files.tokenTtlMs` | 15 min | 签名链接有效期 |
@@ -834,6 +866,10 @@ DSH_BASE_URL=http://127.0.0.1:3080 DSH_API_TOKEN=xxxx dsh-gateway
 9. **异步 run 结果在内存**：1 小时 TTL，重启丢失（含其中的 `files`）。
 10. **模型绑定会写部署默认**：`selectModel` 的既有语义，会话内不受影响（见 2.5）。
 11. **`has_more` 恒为 false**：历史一次性取最近 N 条，没有游标分页。
+12. **提问只支持 legacy 形态**：答案必须落在 `questions.waitMs` 窗口内，且只在网关进程内存里；
+    进程重启即丢失。timed 形态（可事后补答）未实现，见 [`docs/questions.md`](docs/questions.md)。
+13. **浏览器会抢答**：同一实例开着浏览器界面时，`user-questions/request` 可能被浏览器接管，
+    此时 API 侧的 `GET /questions` 一直为空。要么别同实例开浏览器，要么把它当人工兜底。
 
 **路线图**
 
@@ -921,10 +957,12 @@ with c.stream("POST", f"/v1/sessions/{sid}/messages",
 ```bash
 for f in src/*.mjs scripts/*.mjs; do node --check "$f" || echo "FAIL $f"; done
 node scripts/test-files.mjs                       # 文件能力的离线单测（54 项，不需要 DSH）
+node scripts/test-questions.mjs                   # 提问表单的离线单测（21 项，不需要 DSH）
 node scripts/smoke.mjs http://127.0.0.1:8787 <key> <agentId>
 DSH_SMOKE_FILES=1 node scripts/smoke.mjs ...      # 额外验证「回答 + present + 下载」全链路
 ```
 
 冒烟脚本覆盖：健康检查、401、agents、models、模型来源、建会话、blocking、续聊、历史、
 会话详情、会话列表、SSE（start/delta/done）、raw（snapshot→turn/end）、404（session/agent）、
-跨 key 隔离、列目录、下载、Range、越界 403、伪造链接 403、异步 runs、产物清单、签名链接、usage、metrics。
+跨 key 隔离、列目录、下载、Range、越界 403、伪造链接 403、异步 runs、产物清单、签名链接、
+提问列表、未知问题 409、usage、metrics。

@@ -89,6 +89,11 @@
     "tokenTtlMs": 900000,
     "includeWritten": true
   },
+  "questions": {
+    "_comment": "ask_user_question 表单。enabled:false 只是「收到就放行」，事件流仍会订阅——不订阅会让那一轮悬挂。",
+    "enabled": true,
+    "waitMs": 120000
+  },
   "storage": {
     "conversationsFile": "data/conversations.json",
     "usageFile": "data/usage.json"

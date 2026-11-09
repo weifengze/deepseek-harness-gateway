@@ -173,6 +173,20 @@ async function main() {
   })
   check('未知 session 返回 404', missing.status === 404, `status=${missing.status}`)
 
+  // ── 提问：待答列表的形状（真正的问答需要模型配合，放在 docs/questions.md 里手工验） ──
+  const questions = await getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/questions`, { headers })
+  check('GET /sessions/{id}/questions 形状正确',
+    questions.status === 200 && questions.body?.object === 'list' && Array.isArray(questions.body?.data),
+    `status=${questions.status} size=${(questions.body?.data ?? []).length}`)
+
+  const answerUnknown = await getJson(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/questions/q_does_not_exist/answer`,
+    { method: 'POST', headers, body: JSON.stringify({ answers: [] }) },
+  )
+  check('未知问题提交答案返回 409',
+    answerUnknown.status === 409 && answerUnknown.body?.code === 'question_not_pending',
+    `status=${answerUnknown.status} code=${answerUnknown.body?.code}`)
+
   // ── 文件：列目录 / 下载 / 越界拒绝 ──────────────────────────────────
   const fileList = await getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/files?limit=50`, { headers })
   check('GET /sessions/{id}/files 列出工作目录',

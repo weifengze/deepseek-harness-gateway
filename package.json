@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-gateway",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "HTTP API for DeepSeek Harness: install as a dsh plugin bundle or run standalone, then call your configured agents through agents / sessions / messages / runs / files, with SSE streaming, raw event passthrough, async runs, downloadable deliverables, per-key metering and tenant isolation.",
   "type": "module",
   "license": "MIT",
@@ -30,13 +30,14 @@
     "config.example.json",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "scripts/test-questions.mjs"
   ],
   "scripts": {
     "start": "node src/index.mjs",
     "smoke": "node scripts/smoke.mjs",
-    "test": "node scripts/test-files.mjs",
-    "check": "node --check src/index.mjs && node --check src/config.mjs && node --check src/cordis-client.mjs && node --check src/deliverables.mjs && node --check src/dsh-client.mjs && node --check src/errors.mjs && node --check src/files.mjs && node --check src/metrics.mjs && node --check src/plugin.mjs && node --check src/runner.mjs && node --check src/server.mjs && node --check src/sessions.mjs && node --check src/supervisor.mjs && node --check src/usage.mjs && node --check scripts/smoke.mjs && node --check scripts/test-files.mjs",
+    "test": "node scripts/test-files.mjs && node scripts/test-questions.mjs",
+    "check": "node --check src/index.mjs && node --check src/config.mjs && node --check src/cordis-client.mjs && node --check src/deliverables.mjs && node --check src/dsh-client.mjs && node --check src/errors.mjs && node --check src/files.mjs && node --check src/metrics.mjs && node --check src/questions.mjs && node --check src/plugin.mjs && node --check src/runner.mjs && node --check src/server.mjs && node --check src/sessions.mjs && node --check src/supervisor.mjs && node --check src/usage.mjs && node --check scripts/smoke.mjs && node --check scripts/test-files.mjs && node --check scripts/test-questions.mjs",
     "prepublishOnly": "npm run check && npm test"
   },
   "keywords": [

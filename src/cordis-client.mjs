@@ -83,6 +83,22 @@ export class CordisDshClient {
     return 'cordis:in-process'
   }
 
+  /**
+   * 接管提问：在宿主进程内挂 `user-questions/request` 瀑布监听。
+   *
+   * 与 sidecar 模式的差别：这里拿到的是原始事件（含 `agent` 实例），不需要
+   * `$events` 流，也不需要 `interactions=answer`——但两边的表单状态是同一份，
+   * HTTP 路由由 `server.mjs` 统一暴露。
+   *
+   * @param {import('./questions.mjs').QuestionBroker} broker
+   * @param {(level: string, message: string, extra?: object) => void} [log]
+   * @param {boolean} [hold] false = 直接放行
+   */
+  async attachQuestionChannel(broker, log, hold = true) {
+    const { attachCordisQuestions } = await import('./questions.mjs')
+    return attachCordisQuestions({ ctx: this.#ctx, broker, log, hold })
+  }
+
   /** 服务缺失多半是 profile 没挂载对应插件；给出可定位的错误而不是 undefined 调用。 */
   #service(name) {
     const service = this.#ctx.get(name)

@@ -22,6 +22,7 @@ import { SessionLocks, SessionStore } from './sessions.mjs'
 import { UsageStore } from './usage.mjs'
 import { Metrics } from './metrics.mjs'
 import { DeliverableBag } from './deliverables.mjs'
+import { QuestionBroker } from './questions.mjs'
 import {
   DownloadSigner, FileGuard, FileService, contentDisposition, contentTypeFor, parseRange,
   randomSigningSecret, toSlashes,
@@ -260,6 +261,8 @@ function routeLabel(path) {
   if (/^\/v1\/sessions\/[^/]+$/.test(path)) return 'sessions.get'
   if (/^\/v1\/sessions\/[^/]+\/messages$/.test(path)) return 'messages'
   if (/^\/v1\/sessions\/[^/]+\/cancel$/.test(path)) return 'sessions.cancel'
+  if (/^\/v1\/sessions\/[^/]+\/questions$/.test(path)) return 'questions.list'
+  if (/^\/v1\/sessions\/[^/]+\/questions\/[^/]+\/answer$/.test(path)) return 'questions.answer'
   if (/^\/v1\/sessions\/[^/]+\/files$/.test(path)) return 'files.list'
   if (/^\/v1\/sessions\/[^/]+\/files\/.+$/.test(path)) return 'files.download'
   if (/^\/v1\/files\/[^/]+$/.test(path)) return 'files.token'
@@ -285,6 +288,24 @@ export function createGateway({ config, client, log }) {
   // 签名密钥不配就每进程随机：下载链接本来就短命，重启作废是可接受代价。
   const signer = new DownloadSigner(config.files.signingSecret ?? randomSigningSecret())
   const filesEnabled = config.files.enabled
+  /** 待答问题：`ask_user_question` 的表单在这里挂起，等 HTTP 调用方提交。 */
+  const questions = new QuestionBroker({ waitMs: config.questions.waitMs, log, metrics })
+  const questionsEnabled = config.questions.enabled
+  /**
+   * 订阅转发事件流。**即使关掉提问也要订阅**：DSH 会把无人应答的 waterfall
+   * 一直挂在内存里，网关不接就等于让那一轮永远不结束（实测 150s 无响应）。
+   * `enabled:false` 只表示「拿到提问就直接放行」，让工具快速失败。
+   */
+  const questionChannelPromise = (async () => {
+    if (typeof client.attachQuestionChannel !== 'function') return undefined
+    try {
+      return await client.attachQuestionChannel(questions, log, questionsEnabled)
+    } catch (error) {
+      log('warn', 'questions.channel.failed', { error: error.message })
+      return undefined
+    }
+  })()
+  questionChannelPromise.catch(() => {})
   /** 进行中的运行：runId → 控制信息（含 AbortController）。 */
   const activeRuns = new Map()
   /** 异步运行的终态记录：runId → 可查询结果。 */
@@ -442,6 +463,8 @@ export function createGateway({ config, client, log }) {
       created_at: Math.floor(row.createdAt / 1000),
       last_used_at: Math.floor(row.lastUsedAt / 1000),
       running: summary.running === true,
+      // 有表单在等答案时，调用方多半正卡在一个 blocking 请求上——这个数字就是线索。
+      pending_questions: questions.list(row.id).length,
     }
   }
 
@@ -892,6 +915,7 @@ export function createGateway({ config, client, log }) {
     const messageId = `msg_${randomUUID().replaceAll('-', '')}`
     const createdAt = Math.floor(Date.now() / 1000)
     let channel
+    let unsubscribeQuestions
 
     res.on('close', () => {
       if (!res.writableEnded) controller.abort()
@@ -909,6 +933,29 @@ export function createGateway({ config, client, log }) {
       if (streaming) {
         channel = sseChannel(res, requestId, config.server.heartbeatMs)
         channel.send({ type: 'start', session_id: sessionId, message_id: messageId, agent: agent.id, created_at: createdAt })
+        // 提问是**带外**事件：它不属于某条消息，但必须让正在看的调用方立刻知道。
+        unsubscribeQuestions = questions.subscribe((event) => {
+          if (event.question.session_id !== sessionId) return
+          if (event.kind === 'open') {
+            channel.send({
+              type: 'question',
+              session_id: sessionId,
+              message_id: messageId,
+              question_id: event.question.id,
+              questions: event.question.questions,
+              created_at: event.question.created_at,
+              expires_at: event.question.expires_at,
+            })
+          } else {
+            channel.send({
+              type: 'question_closed',
+              session_id: sessionId,
+              message_id: messageId,
+              question_id: event.question.id,
+              reason: event.reason,
+            })
+          }
+        })
       }
 
       let sentDelta = false
@@ -993,6 +1040,7 @@ export function createGateway({ config, client, log }) {
         ms: outcome.metadata.elapsed_ms,
       })
     } finally {
+      unsubscribeQuestions?.()
       activeRuns.delete(messageId)
       releaseSlot()
       if (channel && !res.writableEnded) channel.close()
@@ -1050,6 +1098,54 @@ export function createGateway({ config, client, log }) {
     // 顺手补上档案里缺的 cwd：之后下载不必每次都去问 DSH。
     if (summary.cwd !== undefined) store.setCwd(row.id, summary.cwd)
     json(res, 200, sessionObject(row, summary), requestId)
+  }
+
+  /** GET /v1/sessions/{id}/questions —— 当前在等答案的表单。 */
+  const handleListQuestions = async (req, res, requestId, sessionId) => {
+    const key = authenticate(req)
+    const row = store.assertOwner(sessionId, key)
+    const rows = questions.list(row.id)
+    json(res, 200, {
+      object: 'list',
+      data: rows,
+      has_more: false,
+      ...(questionsEnabled ? {} : { note: 'questions.enabled=false：提问会被直接放行，工具以 NO_PROVIDER 失败' }),
+    }, requestId)
+  }
+
+  /**
+   * POST /v1/sessions/{id}/questions/{questionId}/answer
+   *
+   * body 二选一：
+   *   `{ "answers": [{ "id": "q1", "selected": ["A"] }, ...] }` —— 逐个问题回答
+   *   `{ "decline": true }` —— 放弃这次提问（工具收到 NO_PROVIDER）
+   */
+  const handleAnswerQuestion = async (req, res, requestId, sessionId, questionId) => {
+    const key = authenticate(req)
+    const row = store.assertOwner(sessionId, key)
+    if (!questionsEnabled) {
+      throw new ApiError(409, 'conflict_error', 'questions_disabled',
+        '本次部署关闭了 questions（config.questions.enabled=false），提问会被直接放行',
+        { question_id: questionId })
+    }
+    const body = await readJsonBody(req, config.server.maxBodyBytes)
+    if (body.decline === true) {
+      if (!questions.decline(questionId, 'declined')) {
+        throw new ApiError(409, 'conflict_error', 'question_not_pending',
+          `问题 ${questionId} 不在等待答案（可能已超时或被撤销）`, { question_id: questionId })
+      }
+      log('info', 'question.declined', {
+        request_id: requestId, key: key.id, session: row.id, question: questionId,
+      })
+      json(res, 200, { object: 'question', id: questionId, session_id: row.id, declined: true }, requestId)
+      return
+    }
+    const result = questions.answer(questionId, body.answers ?? [], row.id)
+    log('info', 'question.answered', {
+      request_id: requestId, key: key.id, session: row.id, question: questionId,
+      count: Array.isArray(body.answers) ? body.answers.length : 0,
+    })
+    json(res, 200, { object: 'question', ...result, declined: false }, requestId)
   }
 
   /** POST /v1/sessions/{id}/cancel：按会话取消，不必先记住 message_id。 */
@@ -1450,6 +1546,8 @@ export function createGateway({ config, client, log }) {
             'POST /v1/sessions/{id}/cancel',
             'POST /v1/sessions/{id}/messages          { input, stream?: false|true|"raw" }',
             'GET  /v1/sessions/{id}/messages?limit=',
+            'GET  /v1/sessions/{id}/questions          待答表单（ask_user_question）',
+            'POST /v1/sessions/{id}/questions/{qid}/answer  { answers:[{id,selected,custom?}] } | { decline:true }',
             'GET  /v1/sessions/{id}/files?path=&limit=',
             'GET  /v1/sessions/{id}/files/{path}       (?inline=1)',
             'GET  /v1/files/{token}                    签名链接，免 Bearer',
@@ -1477,6 +1575,20 @@ export function createGateway({ config, client, log }) {
       match = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path)
       if (req.method === 'POST' && match) {
         return await handleCancelSession(req, res, requestId, decodeSegment(match[1]))
+      }
+
+      // 提问：待答表单与提交答案。放在 /files 与 /sessions/{id} 之前，
+      // 否则 `{id}` 会把 `questions` 吞掉。
+      match = /^\/v1\/sessions\/([^/]+)\/questions$/.exec(path)
+      if (req.method === 'GET' && match) {
+        return await handleListQuestions(req, res, requestId, decodeSegment(match[1]))
+      }
+
+      match = /^\/v1\/sessions\/([^/]+)\/questions\/([^/]+)\/answer$/.exec(path)
+      if (req.method === 'POST' && match) {
+        return await handleAnswerQuestion(
+          req, res, requestId, decodeSegment(match[1]), decodeSegment(match[2]),
+        )
       }
 
       // 文件：先精确匹配目录列举，再匹配带路径的下载。
@@ -1547,6 +1659,9 @@ export function createGateway({ config, client, log }) {
     presetCatalog: presets,
     async close() {
       clearInterval(pruneTimer)
+      questions.close()
+      const channel = await questionChannelPromise.catch(() => undefined)
+      await channel?.close?.()
       for (const run of activeRuns.values()) run.controller.abort()
       await new Promise(resolve => server.close(resolve))
     },

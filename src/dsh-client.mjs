@@ -188,6 +188,7 @@ function pickSessionCookie(headers) {
 export class DshClient {
   #baseUrl
   #getToken
+  #interactions
   #cookie
   #authInFlight
   #ws
@@ -201,11 +202,13 @@ export class DshClient {
    * @param {string} options.baseUrl DSH web 监听地址，如 http://127.0.0.1:3080
    * @param {string} [options.token] 固定令牌（与 getToken 二选一）
    * @param {() => Promise<string | undefined>} [options.getToken] 每次握手重新解析令牌，支持文件热更新
+   * @param {'none' | 'answer'} [options.interactions] 是否声明「能替人应答」（见 `attachQuestionChannel`）
    * @param {(level: string, message: string, extra?: object) => void} [options.log]
    */
-  constructor({ baseUrl, token, getToken, log }) {
+  constructor({ baseUrl, token, getToken, interactions = 'answer', log }) {
     this.#baseUrl = (baseUrl ?? '').replace(/\/+$/, '')
     this.#getToken = getToken ?? (async () => token)
+    this.#interactions = interactions
     this.#log = log ?? (() => {})
   }
 
@@ -242,8 +245,10 @@ export class DshClient {
       }
       const url = new URL(`${this.#baseUrl}${CONNECT_PATH}`)
       url.searchParams.set('token', token)
-      // 外部调用方不具备“替人回答”的交互能力，固定 none。
-      url.searchParams.set('interactions', 'none')
+      // `interactions` 决定这个 Peer 能不能打开 `$events`、能不能替人应答 waterfall。
+      // 网关现在确实会应答（提问表单），所以默认 answer；关掉提问通道时仍保持 answer，
+      // 否则任何转发事件都不会投递给网关，宿主只能挂到天荒地老。
+      url.searchParams.set('interactions', this.#interactions)
       let response
       try {
         response = await fetch(url, { redirect: 'manual' })
@@ -410,6 +415,46 @@ export class DshClient {
     this.#streams.set(streamId, { stream, endpoint })
     socket.send(JSON.stringify({ type: 'open', streamId, endpoint, payload: { args } }))
     return stream
+  }
+
+  /**
+   * 打开转发事件流（`$events`）。
+   *
+   * 这条流承载 Host 主动推给客户端的事件：`ready`（带 clientId）、`waterfall`
+   * （需要当面给结论）与 `cancel`。**必须**有人在听：DSH 会把未被应答的 waterfall
+   * 一直挂在内存里，导致发起那一轮永远不结束。
+   *
+   * @returns {Promise<RemoteStream>} 帧原样透出，由 `attachRemoteQuestions` 解释
+   */
+  async openEvents() {
+    return this.openStream('$events', {})
+  }
+
+  /**
+   * 回一个 waterfall 的结论。
+   * @param {string} clientId `ready` 帧里的身份
+   * @param {string} eventId `waterfall` 帧里的事件 id
+   * @param {{kind: 'next'} | {kind: 'result', value?: unknown} | {kind: 'rejected', error: object}} outcome
+   */
+  async replyEvent(clientId, eventId, outcome) {
+    return this.call('$events/result', { clientId, eventId, outcome }, { timeoutMs: 15_000 })
+  }
+
+  /**
+   * 接管提问：订阅 `$events`，把 `user-questions/request` 变成本进程里的待答表单。
+   * @param {import('./questions.mjs').QuestionBroker} broker
+   * @param {(level: string, message: string, extra?: object) => void} [log]
+   * @param {boolean} [hold] false = 只保证不悬挂，提问直接放行
+   */
+  async attachQuestionChannel(broker, log, hold = true) {
+    const { attachRemoteQuestions } = await import('./questions.mjs')
+    return attachRemoteQuestions({
+      openEvents: () => this.openEvents(),
+      replyEvent: (clientId, eventId, outcome) => this.replyEvent(clientId, eventId, outcome),
+      broker,
+      log,
+      hold,
+    })
   }
 
   close() {
