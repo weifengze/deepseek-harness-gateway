@@ -35,5 +35,5 @@
         # models:
         #   default: { provider: deepseek-official, model: deepseek-flash, reasoningEffort: max }
         # storage:
-        #   conversationsFile: E:/dsh-api-gateway-data/conversations.json
-        #   usageFile: E:/dsh-api-gateway-data/usage.json
+        #   conversationsFile: /var/lib/dsh-gateway/conversations.json
+        #   usageFile: /var/lib/dsh-gateway/usage.json
