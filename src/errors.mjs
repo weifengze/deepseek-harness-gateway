@@ -33,6 +33,14 @@ const RULES = [
   [/^session\/not-found$/, 404, 'not_found_error'],
   [/^session\/(agent-busy|migration-required|projections-unavailable)$/, 409, 'conflict_error'],
   [/^workspace\/not-found$/, 404, 'not_found_error'],
+  // 文件读面（DSH workspaceFiles）：网关自己也会归一，这里是兜底，
+  // 避免漏网点把 404 抖成 502。
+  [/^workspace-file\/not-found$/, 404, 'not_found_error'],
+  [/^workspace-file\/outside-workspace$/, 403, 'permission_error'],
+  [/^workspace-file\/too-large$/, 413, 'invalid_request_error'],
+  [/^workspace-file\/(not-text|not-regular-file|not-directory|unsupported-address)$/, 400, 'invalid_request_error'],
+  [/^workspace-file\/(unknown-workspace|watch-unsupported)$/, 409, 'conflict_error'],
+  [/^workspace-file\//, 502, 'upstream_error'],
   [/^agent-preset\/(not-found)$/, 404, 'not_found_error'],
   [/^agent-preset\/locked$/, 409, 'conflict_error'],
   [/^session\/provider-models-unavailable$/, 503, 'service_unavailable'],

@@ -143,6 +143,27 @@ curl -s http://127.0.0.1:8787/metrics -H "Authorization: Bearer $ADMIN_KEY"
 
 实测：admin key → `200`（463 bytes 起）；普通 key → `403`。
 
+### 4.4 文件下载的读面选择
+
+`GET /v1/sessions/{id}/files*` 读的是 Agent 工作目录里的真实文件，两种形态差别很大：
+
+| 部署 | `files.reader` | 原因 |
+|---|---|---|
+| 形态 B 一体化 | `auto`（默认）即可 | 网关与 DSH 同容器，`/workspace` 两边都看得见；`auto` 会先用 DSH 的 `workspaceFiles` |
+| 形态 A 网关独占 + DSH 在另一个容器 | 必须 `"dsh"` | 网关容器里没有 `/workspace`，本地 fs 读不到；`auto` 探测到 `workspaceFiles` 可用时也会走 DSH，但显式写死更稳 |
+
+多副本部署时**必须**设 `files.signingSecret`（≥16 字符），否则签名链接只在签发它的那个实例上有效：
+
+```bash
+-e DSH_GATEWAY_FILES_ENABLED=true
+-e DSH_GATEWAY_FILES_ROOTS=/workspace/out        # 需要放开 cwd 之外的目录时
+-e DSH_GATEWAY_PUBLIC_BASE_URL=https://api.example.com
+```
+
+> `files.roots` 是**网关进程**看到的路径。形态 A 下它指向的目录必须在网关容器里存在，
+> 否则只能靠 `reader:"dsh"` 走 DSH 侧的路径。两条路径不通时，下载会以 `file_not_found` 失败，
+> 不会静默返回空文件。
+
 ---
 
 ## 5. 编排

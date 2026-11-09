@@ -79,6 +79,15 @@
     "maxImagesPerRequest": 4,
     "maxImageBytes": 8388608
   },
+  "files": {
+    "_comment": "产物下载。允许范围 = 每个会话的 cwd + 这里的 roots；不接受整盘/根目录。多实例部署必须显式配置 signingSecret，否则各实例签发的链接互不认。",
+    "enabled": true,
+    "reader": "auto",
+    "roots": [],
+    "maxBytes": 33554432,
+    "tokenTtlMs": 900000,
+    "includeWritten": true
+  },
   "storage": {
     "conversationsFile": "data/conversations.json",
     "usageFile": "data/usage.json"

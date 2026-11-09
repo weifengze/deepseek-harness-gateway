@@ -91,6 +91,80 @@ export class RemoteStream {
 const CONNECT_PATH = '/connect'
 const MUX_PATH = '/api/remote.mux'
 
+/** 校验 `server-response` 信封并取出成功值；业务失败转成 DshError。 */
+function unwrapEnvelope(envelope, endpoint) {
+  const result = envelope?.result
+  if (!result || typeof result.ok !== 'boolean') {
+    throw new DshTransportError(`调用 ${endpoint} 返回了无效信封`)
+  }
+  if (!result.ok) {
+    const error = result.error ?? {}
+    throw new DshError(error.code ?? 'gateway/internal', error.message ?? '未知错误', error.details ?? {})
+  }
+  return result.value
+}
+
+/**
+ * 把附件写回信封里它原本的占位位置。
+ *
+ * Connection 在传输二进制结果时会把 `Uint8Array` 摘出来，跑一次 `multipart/form-data`：
+ * `metadata` 是原信封（占位处为 null），`bytes-N` 是裸字节，`attachments[].path`
+ * 是**相对结果值**的键路径（实测 `readBytes` 给的是 `["data"]`）。
+ * 三个候选基准按「从具体到整体」试，并且要求占位键真实存在——否则宁可判失败，
+ * 也不要悄悄把字节塞到一个没人读的字段上。
+ */
+function applyAttachment(envelope, segments, bytes) {
+  if (!Array.isArray(segments) || segments.length === 0) return false
+  const leaf = segments[segments.length - 1]
+  for (const base of [envelope?.result?.value, envelope?.result, envelope]) {
+    let cursor = base
+    let reachable = cursor !== null && typeof cursor === 'object'
+    for (const key of segments.slice(0, -1)) {
+      if (!reachable || cursor === null || typeof cursor !== 'object' || !(key in cursor)) {
+        reachable = false
+        break
+      }
+      cursor = cursor[key]
+    }
+    if (!reachable || cursor === null || typeof cursor !== 'object') continue
+    // 占位键必须已经存在：这是「找对了基准」的唯一证据。
+    if (!(leaf in cursor)) continue
+    cursor[leaf] = bytes
+    return true
+  }
+  return false
+}
+
+/** 解析二进制 RPC 的分段响应，还原成与普通调用同构的信封。 */
+async function readMultipartEnvelope(response) {
+  const form = await response.formData()
+  const metadata = form.get('metadata')
+  if (typeof metadata !== 'string') {
+    throw new DshTransportError('二进制响应缺少 metadata 部分')
+  }
+  let envelope
+  try {
+    envelope = JSON.parse(metadata)
+  } catch (error) {
+    throw new DshTransportError(`二进制响应的 metadata 不是合法 JSON: ${error.message}`)
+  }
+  const attachments = Array.isArray(envelope?.attachments) ? envelope.attachments : []
+  const unplaced = []
+  for (const attachment of attachments) {
+    const part = form.get(attachment?.part)
+    if (part === null || typeof part === 'string') continue
+    const bytes = new Uint8Array(await part.arrayBuffer())
+    if (!applyAttachment(envelope, attachment.path, bytes)) unplaced.push(bytes)
+  }
+  // 路径对不上时退一步：只有一个附件且结果里有 data 占位，就认它。
+  if (unplaced.length === 1 && envelope?.result?.value?.data === null) {
+    envelope.result.value.data = unplaced[0]
+  }
+  delete envelope.attachments
+  return envelope
+}
+
+
 /** 把 http(s) 基址换成 ws(s) 基址。 */
 function toWsBase(baseUrl) {
   const url = new URL(baseUrl)
@@ -232,16 +306,12 @@ export class DshClient {
         const text = await response.text().catch(() => '')
         throw new DshTransportError(`调用 ${endpoint} 返回 HTTP ${response.status}: ${text.slice(0, 200)}`)
       }
-      const envelope = await response.json()
-      const result = envelope?.result
-      if (!result || typeof result.ok !== 'boolean') {
-        throw new DshTransportError(`调用 ${endpoint} 返回了无效信封`)
-      }
-      if (!result.ok) {
-        const error = result.error ?? {}
-        throw new DshError(error.code ?? 'gateway/internal', error.message ?? '未知错误', error.details ?? {})
-      }
-      return result.value
+      // `workspaceFiles/readBytes` 这类带二进制的 RPC 回的是 multipart，不是 JSON 信封。
+      const contentType = response.headers.get('content-type') ?? ''
+      const envelope = contentType.includes('multipart/form-data')
+        ? await readMultipartEnvelope(response)
+        : await response.json()
+      return unwrapEnvelope(envelope, endpoint)
     }
     return run(true)
   }

@@ -14,11 +14,15 @@ import { RemoteStream } from './dsh-client.mjs'
 import { ApiError } from './errors.mjs'
 
 /**
- * 线名 → 服务方法名 + 参数键。
+ * 线名 → 服务方法名 + 参数装配。
  *
  * 参数键必须与 `@Remote` 方法的**形参名**一致：Cordis 按名字对号入座，
  * 例如 `list(_request, signal)` 的线名参数是 `_request`，而 `create(request)` 是 `request`。
  * 显式列出，避免把任意字符串拼进服务调用。
+ *
+ * `build` 用于带 Typert lookup 参数的方法：线上只有 `workspaceFileScopeId`（会话 id），
+ * 由 Host 解析成 `WorkspaceFileScope`；进程内调用没有这层解析，所以由网关自己拼出来。
+ * `workspaceRoot` 用会话 cwd——网关每次传的都是绝对路径，它只影响相对路径解析与目录列举。
  */
 const METHODS = new Map([
   ['session/create', { service: 'sessionController', method: 'create', arg: 'request' }],
@@ -30,7 +34,32 @@ const METHODS = new Map([
   ['session/projections', { service: 'sessionController', method: 'projections', arg: 'request' }],
   ['session/modelCatalog', { service: 'sessionController', method: 'modelCatalog' }],
   ['agentPresets/list', { service: 'agentPresets', method: 'remoteExportList' }],
+  ['workspaceFiles/stat', {
+    service: 'workspaceFiles',
+    method: 'stat',
+    build: (args, options) => [fileScope(args, options), args.path],
+  }],
+  ['workspaceFiles/list', {
+    service: 'workspaceFiles',
+    method: 'list',
+    build: (args, options) => [fileScope(args, options), args.path],
+  }],
+  ['workspaceFiles/readBytes', {
+    service: 'workspaceFiles',
+    method: 'readBytes',
+    build: (args, options) => [fileScope(args, options), args.path, args.options ?? {}],
+  }],
 ])
+
+/**
+ * 拼出 `WorkspaceFileScope`。
+ *
+ * 线上只有 `workspaceFileScopeId`，由 Host 的 lookup 解析成 scope；进程内没有这层，
+ * 所以 workspaceRoot 由调用方作为**带外选项**传进来（HTTP 适配层会忽略它）。
+ */
+function fileScope(args, options) {
+  return { sessionId: args.workspaceFileScopeId, workspaceRoot: options?.workspaceRoot }
+}
 
 /** 流式线名 → 服务方法名。 */
 const STREAMS = new Map([
@@ -68,7 +97,7 @@ export class CordisDshClient {
    * 调用一个非流式 Remote 方法。
    * @param {string} endpoint 线名，如 `session/create`
    * @param {object} [args] 网关侧统一用 `{ request }` 信封
-   * @param {{ timeoutMs?: number }} [options]
+   * @param {{ timeoutMs?: number, workspaceRoot?: string }} [options] 带外选项（workspaceRoot 只给 lookup 参数用）
    */
   async call(endpoint, args = {}, options = {}) {
     const entry = METHODS.get(endpoint)
@@ -76,12 +105,14 @@ export class CordisDshClient {
       throw new ApiError(500, 'upstream_error', 'unsupported_endpoint', `插件模式未映射的接口：${endpoint}`)
     }
     const service = this.#service(entry.service)
-    // 按线名声明的参数键取值；无参方法（如 modelCatalog）不传。
-    const request = entry.arg === undefined ? undefined : args?.[entry.arg]
+    // 按线名声明的参数装配；无参方法（如 modelCatalog）保持 undefined。
+    const positional = entry.build
+      ? entry.build(args ?? {}, options)
+      : [entry.arg === undefined ? undefined : args?.[entry.arg]]
     // 服务方法的第二个参数是取消信号；超时用它表达，避免留下悬挂的调用。
     const signal = options.timeoutMs === undefined ? undefined : AbortSignal.timeout(options.timeoutMs)
     try {
-      const value = await service[entry.method](request, signal)
+      const value = await service[entry.method](...positional, signal)
       return value
     } catch (error) {
       if (error instanceof ApiError) throw error

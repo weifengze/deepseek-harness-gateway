@@ -56,12 +56,31 @@ export class SessionStore {
     return this.#data.conversations[id]
   }
 
-  /** 记录一个新会话的归属。 */
-  create({ id, keyId, agent, model, modelSource, title }) {
+  /** 记录一个新会话的归属。`cwd` 是文件下载的允许根，建会话时能定就先定下来。 */
+  create({ id, keyId, agent, model, modelSource, title, cwd }) {
     const now = Date.now()
-    this.#data.conversations[id] = { id, keyId, agent, model, modelSource, title, createdAt: now, lastUsedAt: now }
+    this.#data.conversations[id] = {
+      id,
+      keyId,
+      agent,
+      model,
+      modelSource,
+      title,
+      ...(typeof cwd === 'string' && cwd.length > 0 ? { cwd } : {}),
+      createdAt: now,
+      lastUsedAt: now,
+    }
     this.#save()
     return this.#data.conversations[id]
+  }
+
+  /** 补齐会话工作目录：建会话时没声明 cwd（用 DSH 默认）时，从 `session/list` 反查后写回。 */
+  setCwd(id, cwd) {
+    const row = this.#data.conversations[id]
+    if (!row || typeof cwd !== 'string' || cwd.length === 0 || row.cwd === cwd) return row
+    row.cwd = cwd
+    this.#save()
+    return row
   }
 
   touch(id) {

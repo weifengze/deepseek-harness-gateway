@@ -5,7 +5,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { delimiter, isAbsolute, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const DEFAULTS = {
@@ -39,6 +39,16 @@ const DEFAULTS = {
     maxSessionsPerKey: 200,
     maxImagesPerRequest: 4,
     maxImageBytes: 8 * 1024 * 1024,
+  },
+  files: {
+    enabled: true,
+    reader: 'auto',
+    roots: [],
+    maxBytes: 32 * 1024 * 1024,
+    tokenTtlMs: 15 * 60 * 1000,
+    includeWritten: true,
+    publicBaseUrl: undefined,
+    signingSecret: undefined,
   },
   storage: {
     conversationsFile: 'data/conversations.json',
@@ -166,6 +176,59 @@ export function decorateAgents(config) {
       : config.models.default !== undefined ? 'models.default' : 'dsh-default'
   }
   return config
+}
+
+const FILE_READERS = new Set(['auto', 'dsh', 'local'])
+
+/**
+ * 规范化 `files` 段。
+ *
+ * 允许根里拒绝「整盘/根目录」：那等于把整机文件交给任何一个持 key 的调用方，
+ * 是误配置而不是需求；要放开就逐条列出业务目录。
+ * @param {object} value 已与默认值合并后的 files 段
+ */
+function normalizeFiles(value) {
+  const reader = value.reader ?? 'auto'
+  if (!FILE_READERS.has(reader)) {
+    throw new ConfigError(`files.reader 只能是 auto / dsh / local，收到 ${JSON.stringify(reader)}`)
+  }
+  const roots = []
+  if (value.roots !== undefined) {
+    if (!Array.isArray(value.roots)) throw new ConfigError('files.roots 必须是绝对路径数组')
+    for (const entry of value.roots) {
+      if (typeof entry !== 'string' || entry.trim().length === 0) {
+        throw new ConfigError('files.roots 每项必须是非空字符串')
+      }
+      if (!isAbsolute(entry)) throw new ConfigError(`files.roots 需要绝对路径：${entry}`)
+      const resolved = resolve(entry)
+      if (resolved === resolve('/') || /^[A-Za-z]:[\\/]?$/.test(resolved)) {
+        throw new ConfigError(`files.roots 不接受整盘或根目录：${entry}（等于把整机文件交给调用方）`)
+      }
+      roots.push(resolved)
+    }
+  }
+
+  const { publicBaseUrl, signingSecret } = value
+  if (publicBaseUrl !== undefined && publicBaseUrl !== null && typeof publicBaseUrl !== 'string') {
+    throw new ConfigError('files.publicBaseUrl 必须是字符串')
+  }
+  if (signingSecret !== undefined && signingSecret !== null
+    && (typeof signingSecret !== 'string' || signingSecret.length < 16)) {
+    throw new ConfigError('files.signingSecret 至少 16 个字符（多实例部署必须显式配置，否则各实例签发的链接互不认）')
+  }
+
+  return {
+    enabled: value.enabled !== false,
+    reader,
+    roots,
+    maxBytes: requirePositiveInt(value.maxBytes, 'files.maxBytes'),
+    tokenTtlMs: requirePositiveInt(value.tokenTtlMs, 'files.tokenTtlMs'),
+    includeWritten: value.includeWritten !== false,
+    publicBaseUrl: typeof publicBaseUrl === 'string' && publicBaseUrl.length > 0
+      ? publicBaseUrl.replace(/\/+$/, '')
+      : undefined,
+    signingSecret: typeof signingSecret === 'string' && signingSecret.length > 0 ? signingSecret : undefined,
+  }
 }
 
 /**
@@ -318,6 +381,18 @@ export function buildConfig(raw = {}, { configPath = 'cordis:plugin', inProcess 
     config.models.default = undefined
   }
   decorateAgents(config)
+
+  // 文件下载：对外暴露的是「当前会话工作目录 + 显式放开的业务目录」，不是整机。
+  if (process.env.DSH_GATEWAY_PUBLIC_BASE_URL) config.files.publicBaseUrl = process.env.DSH_GATEWAY_PUBLIC_BASE_URL
+  if (process.env.DSH_GATEWAY_FILES_ROOTS) {
+    config.files.roots = process.env.DSH_GATEWAY_FILES_ROOTS.split(delimiter)
+      .map(entry => entry.trim())
+      .filter(Boolean)
+  }
+  if (process.env.DSH_GATEWAY_FILES_ENABLED) {
+    config.files.enabled = !/^(0|false|no|off)$/i.test(process.env.DSH_GATEWAY_FILES_ENABLED.trim())
+  }
+  config.files = normalizeFiles(config.files ?? {})
 
   if (config.dsh.token === '') config.dsh.token = undefined
   if (config.dsh.tokenFile !== undefined && typeof config.dsh.tokenFile !== 'string') {

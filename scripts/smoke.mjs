@@ -173,6 +173,46 @@ async function main() {
   })
   check('未知 session 返回 404', missing.status === 404, `status=${missing.status}`)
 
+  // ── 文件：列目录 / 下载 / 越界拒绝 ──────────────────────────────────
+  const fileList = await getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/files?limit=50`, { headers })
+  check('GET /sessions/{id}/files 列出工作目录',
+    fileList.status === 200 && fileList.body?.object === 'list' && Array.isArray(fileList.body?.data),
+    `path=${JSON.stringify(fileList.body?.path)} entries=${(fileList.body?.data ?? []).length}`)
+
+  const downloadable = (fileList.body?.data ?? []).find(entry => entry.type === 'file')
+  if (!downloadable) {
+    skip('GET /sessions/{id}/files/{path} 下载', '工作目录里没有可下载的普通文件')
+  } else {
+    const encoded = downloadable.path.split('/').map(encodeURIComponent).join('/')
+    const fileResponse = await fetch(
+      `${base}/v1/sessions/${encodeURIComponent(sessionId)}/files/${encoded}`,
+      { headers: { authorization: `Bearer ${key}` } },
+    )
+    const bytes = Buffer.from(await fileResponse.arrayBuffer())
+    check('GET /sessions/{id}/files/{path} 下载',
+      fileResponse.status === 200 && bytes.length > 0
+        && (fileResponse.headers.get('content-disposition') ?? '').includes('attachment'),
+      `status=${fileResponse.status} bytes=${bytes.length} type=${fileResponse.headers.get('content-type')}`)
+
+    const ranged = await fetch(
+      `${base}/v1/sessions/${encodeURIComponent(sessionId)}/files/${encoded}`,
+      { headers: { authorization: `Bearer ${key}`, range: 'bytes=0-3' } },
+    )
+    check('Range 请求返回 206',
+      ranged.status === 206 && (ranged.headers.get('content-range') ?? '').startsWith('bytes 0-'),
+      `status=${ranged.status} range=${ranged.headers.get('content-range')}`)
+    await ranged.arrayBuffer().catch(() => {})
+  }
+
+  // `%2F` 在 pathname 里不会被规范化掉，所以能真的把绝对路径送进护栏。
+  const escaped = await getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/files/%2Fetc%2Fpasswd`, { headers })
+  check('工作目录外的绝对路径返回 403',
+    escaped.status === 403 && escaped.body?.error?.code === 'file_outside_scope',
+    `status=${escaped.status} code=${escaped.body?.error?.code}`)
+
+  const forged = await getJson('/v1/files/not-a-real-token')
+  check('伪造下载链接返回 403', forged.status === 403, `status=${forged.status}`)
+
   const badAgent = await getJson('/v1/sessions', {
     method: 'POST',
     headers,
@@ -210,6 +250,65 @@ async function main() {
   }
   check('异步 run 收敛', runStatus === 'succeeded' && typeof runBody?.content === 'string',
     `status=${runStatus} content=${JSON.stringify(runBody?.content)}`)
+
+  // ── 回答问题 + 文件下载（会真实让模型写一个文件，默认关闭）──────────
+  // 开启方式：DSH_SMOKE_FILES=1。会在 agent 的 cwd 里留下一个 gateway-smoke-*.txt，
+  // 因为没有删除接口，所以默认不跑。
+  if (process.env.DSH_SMOKE_FILES === '1') {
+    const probe = `gateway-smoke-${Date.now()}.txt`
+    const fileSession = await getJson('/v1/sessions', { method: 'POST', headers, body: JSON.stringify({ agent }) })
+    const answer = await getJson(`/v1/sessions/${encodeURIComponent(fileSession.body?.id)}/messages`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        input: `请用 write 工具把字符串 dsh-gateway-smoke 写入当前目录下的 ${probe}，`
+          + '然后调用 present 把这个文件声明为交付物。写完后只回复两个字：完成',
+        timeout_ms: 240000,
+      }),
+    })
+    const produced = (answer.body?.files ?? [])[0]
+    check('回合带上 files（present 声明的产物）',
+      answer.status === 200 && produced?.source === 'present' && produced?.downloadable === true,
+      `files=${JSON.stringify((answer.body?.files ?? []).map(row => `${row.name}:${row.source}:${row.downloadable}`))}`)
+
+    if (produced?.download_url && produced.downloadable) {
+      // 故意不带 Authorization：签名链接本身就是授权。
+      const linked = await fetch(`${base}${produced.download_url}`)
+      const text = Buffer.from(await linked.arrayBuffer()).toString('utf8')
+      check('签名链接免 Bearer 直接下载',
+        linked.status === 200 && text.includes('dsh-gateway-smoke'),
+        `status=${linked.status} bytes=${text.length}`)
+
+      // 异步 run 也要带回产物：终态记录里必须有同一条 files。
+      const asyncRun = await getJson('/v1/runs', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          session_id: fileSession.body?.id,
+          input: `再调用一次 present，声明 ${probe} 是交付物。只回复两个字：完成`,
+          timeout_ms: 180000,
+        }),
+      })
+      let runFiles = []
+      for (let i = 0; i < 40; i++) {
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        const polled = await getJson(`/v1/runs/${asyncRun.body?.id}`, { headers })
+        if (polled.body?.status === 'succeeded' || polled.body?.status === 'failed') {
+          runFiles = polled.body?.files ?? []
+          break
+        }
+      }
+      check('异步 run 终态带 files', runFiles.length > 0 && runFiles[0].downloadable === true,
+        `files=${JSON.stringify(runFiles.map(row => row.name))}`)
+    } else {
+      skip('签名链接免 Bearer 直接下载', '本轮没有产生可下载文件')
+      skip('异步 run 终态带 files', '本轮没有产生可下载文件')
+    }
+  } else {
+    skip('回合带上 files（present 声明的产物）', '设置 DSH_SMOKE_FILES=1 才跑（会往 cwd 写探针文件）')
+    skip('签名链接免 Bearer 直接下载', '同上')
+    skip('异步 run 终态带 files', '同上')
+  }
 
   const usage = await getJson('/v1/usage', { headers })
   check('GET /v1/usage', usage.status === 200 && (usage.body?.usage?.runs ?? 0) > 0,

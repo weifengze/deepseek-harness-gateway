@@ -117,11 +117,12 @@ function addUsage(total, usage) {
  * @param {string} options.sessionId
  * @param {{type: string, text?: string, mediaType?: string, data?: string}[]} options.content
  * @param {(text: string) => void} [options.onDelta] 文本增量回调（SSE 用）
+ * @param {(event: object) => void} [options.onEvent] 本轮事件回调（产物收集用，只喂属于本轮的）
  * @param {AbortSignal} [options.signal]
  * @param {number} options.timeoutMs
  * @returns {Promise<{answer: string, finishReason: string, usage?: object, steps: number, turn?: number}>}
  */
-export async function runTurn({ client, sessionId, content, onDelta, signal, timeoutMs }) {
+export async function runTurn({ client, sessionId, content, onDelta, onEvent, signal, timeoutMs }) {
   const requestId = `gw-${randomUUID()}`
   const stream = await client.openStream('session/follow', {
     request: { address: { kind: 'session', sessionId }, assistantStream: true },
@@ -245,6 +246,12 @@ export async function runTurn({ client, sessionId, content, onDelta, signal, tim
         }
         default:
           break
+      }
+      // 产物收集只认已认领的本轮事件：认领之前的都属于旧回合，
+      // 混进来会把上一轮的交付物算到这一轮头上。
+      if (confirmed && onEvent) {
+        const turn = event.data?.turn
+        if (turn === undefined || targetTurn === undefined || turn === targetTurn) onEvent(event)
       }
       if (ended) break
     }

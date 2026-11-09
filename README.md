@@ -14,7 +14,11 @@ curl -X POST http://127.0.0.1:8787/v1/sessions \
 curl -X POST http://127.0.0.1:8787/v1/sessions/session-.../messages \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"input":"帮我准备下周的会议预案"}'
-# → {"object":"message","content":"...","turn":1,"usage":{...}}
+# → {"object":"message","content":"...","turn":1,"usage":{...},
+#    "files":[{"name":"会议预案.docx","download_url":"/v1/files/eyJ...","size":24813}]}
+
+curl -OJ "http://127.0.0.1:8787/v1/files/eyJ..."
+# → 会议预案.docx（链接自带授权，不需要 Bearer）
 ```
 
 ---
@@ -31,7 +35,8 @@ DSH 仓库里的 `docs/api-gateway.zh.md` 讲的是 **Host ↔ Client 之间的�
 外部系统 ──Bearer key──▶ dsh-api-gateway ──Cookie / WS──▶ dsh web ──▶ preset ──▶ 工具 / 模型
 ```
 
-网关只做四件事：**鉴权、资源抽象、事件投影、租户与限额**。核心约 3000 行（`src/`），零运行时依赖。
+网关只做四件事：**鉴权、资源抽象、事件投影、租户与限额**（外加把产物文件递出去）。
+核心约 4400 行（`src/`），零运行时依赖。
 
 ### 0.1 两种运行形态
 
@@ -170,6 +175,7 @@ web 端 71 个 client 包，最终落到 13 个 Remote namespace：
 | 工具调用、步骤、审批、反问、子智能体、计划模式 | 都在 `session/follow` 的事件流里 | ✅ `stream:"raw"`（4.6.3）原样转发 |
 | 模型目录、预设清单 | `session/modelCatalog` `agentPresets/list` | ✅ `/v1/models`、`/v1/agents` |
 | 会话历史、投影 | `session/page` `projections` | ✅ `GET /sessions/{id}/messages` |
+| 文件预览 / 工作区文件读 | `workspaceFiles/read` `readBytes` `stat` `list` | ✅ `/v1/sessions/{id}/files`（4.11） |
 | 后台长任务 | `session/prompt` + 事件流 | ✅ `/v1/runs`（网关自建异步壳） |
 | 会话重命名 / 分叉 / 归档 / 置顶 | `session/rename` `fork`、`workspace/archiveSession` `pinSession` | ⬜ 未开放（见 11 节） |
 | 工作区列表 / 创建 | `workspace/create` `follow` | ⬜ 未开放 |
@@ -195,6 +201,7 @@ web 端 71 个 client 包，最终落到 13 个 Remote namespace：
 | `session` | 一次持续对话；绑定 agent 与模型 | 调用方 `POST /v1/sessions` |
 | `message` | 会话里的一条消息；发一条即跑一轮 | 调用方 `POST /v1/sessions/{id}/messages` |
 | `run` | 同一轮对话的异步句柄 | 调用方 `POST /v1/runs` |
+| `file` | 这一轮产出的文件；带一个可直接下载的链接 | Agent 在回合里写出 |
 
 ```mermaid
 flowchart LR
@@ -202,6 +209,7 @@ flowchart LR
   S --> M[message<br/>一轮问答]
   S --> R[run<br/>异步执行]
   R -.产出.-> M
+  M -.交付.-> F[file<br/>签名下载链接]
 ```
 
 ---
@@ -220,7 +228,7 @@ flowchart LR
 ### 4.1 `GET /healthz`（免鉴权）
 
 ```json
-{"status":"ok","version":"0.4.0",
+{"status":"ok","version":"0.5.0",
  "dsh":{"reachable":true,"presets":14,"base_url":"cordis:in-process"}}
 ```
 
@@ -421,8 +429,38 @@ snapshot → agent/inbox/spliced → turn/start → step/start → system/messag
 ```
 
 `/metrics` 输出 Prometheus 文本：`dsh_gateway_requests_total`、`dsh_gateway_runs_total`、
-`dsh_gateway_run_duration`、`dsh_gateway_tokens_total`、`dsh_gateway_active_runs`。
-需要 admin key 或从回环地址访问。
+`dsh_gateway_run_duration`、`dsh_gateway_tokens_total`、`dsh_gateway_active_runs`、
+`dsh_gateway_files_total`。需要 admin key 或从回环地址访问。
+
+### 4.11 文件：产物清单与下载
+
+Agent 答完往往还产出文件。0.5.0 起，**一轮的返回里带 `files`**，每个产物自带签名下载链接：
+
+```json
+{"object":"message","content":"会议预案已写好。","files":[
+  {"object":"file","name":"会议预案.docx","path":"out/会议预案.docx","source":"present",
+   "description":"下周 RRB 会议预案","size":24813,
+   "content_type":"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+   "downloadable":true,"download_url":"/v1/files/eyJzIjoi...","expires_at":1794193172}]}
+```
+
+| 路由 | 说明 |
+|---|---|
+| `GET /v1/sessions/{id}/files?path=&limit=` | 浏览会话工作目录（单层） |
+| `GET /v1/sessions/{id}/files/{path}` | Bearer 鉴权下载；支持 `?inline=1` 与单段 `Range` |
+| `GET /v1/files/{token}` | 签名链接下载，**免 Bearer**，默认 15 分钟内有效 |
+
+三个要点：
+
+1. **产物从事件流里认**，不扫目录：`present` 写下的 `deliverables/presented` 是权威交付声明，
+   `write`/`edit` 成功落盘的结果是兜底。同一文件去重，`present` 优先。
+2. **范围只能由网关收窄**：DSH 的 `workspaceFiles` 允许读工作区之外的文件，
+   所以允许根固定为「会话 cwd + `files.roots`」，并且在 `stat` 拿到 canonical 路径后**再判一次**
+   （防符号链接逃逸）。越界的产物会标 `downloadable:false` + `download_error`，不会让整轮变 500。
+3. **两种 reader**：宿主 `workspaceFiles`（可跨容器）与本地 `node:fs`（零依赖）；
+   `files.reader:"auto"` 只在「上游没有这个能力」时降级，业务错误不降级。
+
+完整规则、安全模型与错误码见 [`docs/files.md`](docs/files.md)。
 
 ---
 
@@ -477,17 +515,25 @@ DSH 只有 owner 身份：同一个 Cookie 能看到并操作所有 session。�
 |---|---|---|
 | 400 | `invalid_json` / `invalid_input` / `empty_input` | 请求体问题 |
 | 400 | `invalid_model` / `invalid_stream` / `invalid_agent` | 参数格式 |
+| 400 | `invalid_path` / `file_not_regular` | 文件路径为空或指向目录 |
 | 401 | `unauthenticated` / `invalid_api_key` | 缺少或错误的 Bearer |
 | 403 | `forbidden` | 非 admin 读 `/metrics` |
 | 403 | `agent_unavailable` | 当前 key 未绑定任何 agent |
+| 403 | `file_outside_scope` / `file_not_readable` | 文件越出允许目录 / 无读权限 |
+| 403 | `invalid_signature` | 签名下载链接被篡改或过期 |
 | 404 | `route_not_found` | 路径不存在 |
 | 404 | `session_not_found` / `run_not_found` | 不存在或不属于当前 key |
 | 404 | `agent_unavailable` | agent 不存在或无权 |
+| 404 | `file_not_found` / `files_disabled` | 文件不存在 / 部署关闭了文件能力 |
 | 408 | `run_timeout` | 超过 `timeout_ms` |
 | 409 | `approval_required` | 本轮需要人工审批，而部署没有审批通道（见 6.4） |
+| 409 | `session_cwd_unknown` | 会话没有工作目录，无法确定文件范围 |
 | 413 | `body_too_large` | 超过 `maxBodyBytes` |
+| 413 | `file_too_large` | 超过 `files.maxBytes` |
+| 416 | `invalid_range` | `Range` 无法满足 |
 | 429 | 见 5.3 | 限流/配额 |
 | 502 | `provider_error` / `session_create_failed` / `run_incomplete` | DSH 或模型侧失败 |
+| 502 | `file_transfer_failed` | 上游给了元数据但没给字节 |
 | 503 | `agent_unavailable` | preset 激活失败（`broken`） |
 | 503 | `dsh_unreachable` | DSH 不可达 |
 | 499 | `client_closed` | 调用方断开（仅日志，不返回体） |
@@ -634,8 +680,17 @@ sequenceDiagram
 | `POST /sessions/{id}/cancel` | `cancelled:1`，SSE 收到 `done{finish_reason:"aborted"}` |
 | 跨 key 读 session | 404（与不存在同码） |
 | 未知 agent / 未知 session | 404 |
+| 列工作目录 | `path:"."`，文件与子目录都带 `type` |
+| 下载 + Range | 200 全文；`Range: bytes=0-4` → 206 `hello` |
+| 中文文件名 | `filename*=UTF-8''%E4%B8%AD%E6%96%87.txt`，内容完整 |
+| 越界路径 `%2Fetc%2Fpasswd` | 403 `file_outside_scope` |
+| 伪造签名链接 | 403 `invalid_signature` |
+| 回合产物 | `present` 声明的文件进 `files`，`source:"present"`，`downloadable:true` |
+| 签名链接下载 | 不带 Authorization → 200，内容正确 |
+| 异步 run 产物 | `GET /v1/runs/{id}` 终态带同一条 `files` |
 | 插件形态（进程内） | `base_url: cordis:in-process`，对话 1140ms，流式 53 个 delta |
-| 冒烟脚本 | `scripts/smoke.mjs` **22 项全 PASS** |
+| 冒烟脚本 | `scripts/smoke.mjs` **28 项全 PASS**（含 `DSH_SMOKE_FILES=1` 的产物链路） |
+| 离线单测 | `scripts/test-files.mjs` **54 项全 PASS** |
 
 ### 9.1 Linux（Ubuntu 24.04，全新机器，无人值守）
 
@@ -739,10 +794,19 @@ DSH_BASE_URL=http://127.0.0.1:3080 DSH_API_TOKEN=xxxx dsh-gateway
 | `auth.keys[].rpm` | 0 | 0 = 不限 |
 | `limits.maxConcurrentRuns` | 8 | 全局并发 |
 | `limits.maxSessionsPerKey` | 200 | 每 key 会话数 |
+| `files.enabled` | true | 关掉后文件路由返回 404 `files_disabled` |
+| `files.reader` | `auto` | `auto` / `dsh` / `local` |
+| `files.roots` | `[]` | 除会话 cwd 外额外允许的绝对目录（拒绝整盘） |
+| `files.maxBytes` | 32 MiB | 单文件下载上限 |
+| `files.tokenTtlMs` | 15 min | 签名链接有效期 |
+| `files.includeWritten` | true | 是否把 `write`/`edit` 产物也算进来 |
+| `files.publicBaseUrl` | — | 反代域名，用于拼绝对 `download_url` |
+| `files.signingSecret` | 每进程随机 | 多实例部署必须显式配置 |
 | `storage.conversationsFile` | `data/conversations.json` | 归属档案 |
 
 环境变量：`DSH_BASE_URL`、`DSH_API_TOKEN`、`DSH_TOKEN`、`DSH_TOKEN_FILE`、`PORT`、`HOST`、
-`DSH_GATEWAY_CONFIG`、`DSH_GATEWAY_API_KEYS`、`DSH_GATEWAY_AGENTS`、`DSH_GATEWAY_DEFAULT_MODEL`。
+`DSH_GATEWAY_CONFIG`、`DSH_GATEWAY_API_KEYS`、`DSH_GATEWAY_AGENTS`、`DSH_GATEWAY_DEFAULT_MODEL`、
+`DSH_GATEWAY_FILES_ENABLED`、`DSH_GATEWAY_FILES_ROOTS`、`DSH_GATEWAY_PUBLIC_BASE_URL`。
 
 > 从 0.3.x 升级：`apps` / `inputTemplate` / `auth.keys[].apps` / `DSH_GATEWAY_APPS` 仍被接受并自动迁移，
 > 但新配置请统一用 `agents` / `template` / `auth.keys[].agents` / `DSH_GATEWAY_AGENTS`。
@@ -761,11 +825,15 @@ DSH_BASE_URL=http://127.0.0.1:3080 DSH_API_TOKEN=xxxx dsh-gateway
 1. **单 owner 身份**：网关持有 owner 凭据（或进程内服务引用），等于拥有 DSH 全部权限。
    不要把同一个实例共享给互不信任的调用方；需要强隔离就一个租户一个 DSH。
 2. **推理增量不透传**：只转发 `text-delta`，reasoning 被丢弃（要完整过程用 `stream:"raw"`）。
-3. **无文件上传**：只支持 base64 内联图片，不支持远程 URL（避免 SSRF）。
-4. **会话只增不删**：DSH 没有删除接口。
-5. **异步 run 结果在内存**：1 小时 TTL，重启丢失。
-6. **模型绑定会写部署默认**：`selectModel` 的既有语义，会话内不受影响（见 2.5）。
-7. **`has_more` 恒为 false**：历史一次性取最近 N 条，没有游标分页。
+3. **文件只读**：能列、能下，不能传、不能改、不能删。写文件仍然只能由 Agent 在会话里做。
+4. **无文件上传**：只支持 base64 内联图片，不支持远程 URL（避免 SSRF）。
+5. **产物只从事件流来**：Agent 用 bash 写、又没 `present` 的文件不会进 `files`（`GET /files` 仍可见）。
+6. **单文件上限 32 MiB**（`files.maxBytes` 可调）：超限返回 413，不做分片下载协议。
+7. **文件不递归列举**：`GET /files` 一次只列一层，和 DSH 的 `list` 一致。
+8. **会话只增不删**：DSH 没有删除接口。
+9. **异步 run 结果在内存**：1 小时 TTL，重启丢失（含其中的 `files`）。
+10. **模型绑定会写部署默认**：`selectModel` 的既有语义，会话内不受影响（见 2.5）。
+11. **`has_more` 恒为 false**：历史一次性取最近 N 条，没有游标分页。
 
 **路线图**
 
@@ -776,6 +844,7 @@ DSH_BASE_URL=http://127.0.0.1:3080 DSH_API_TOKEN=xxxx dsh-gateway
 | P2 | 技能目录 `/v1/skills` | `skills/list` |
 | P2 | 工作区 `/v1/workspaces` | `workspace/follow` 基线流 |
 | P2 | 出站回调（完成推事件） | 参考仓库的 `packages/webhook` |
+| P2 | 产物落库（跨重启可查） | 现在 `files` 只在当轮响应与异步记录里 |
 | P3 | 文件上传（→ `receiptId`） | 需先定义附件生命周期 |
 
 ---
@@ -851,9 +920,11 @@ with c.stream("POST", f"/v1/sessions/{sid}/messages",
 
 ```bash
 for f in src/*.mjs scripts/*.mjs; do node --check "$f" || echo "FAIL $f"; done
+node scripts/test-files.mjs                       # 文件能力的离线单测（54 项，不需要 DSH）
 node scripts/smoke.mjs http://127.0.0.1:8787 <key> <agentId>
+DSH_SMOKE_FILES=1 node scripts/smoke.mjs ...      # 额外验证「回答 + present + 下载」全链路
 ```
 
 冒烟脚本覆盖：健康检查、401、agents、models、模型来源、建会话、blocking、续聊、历史、
 会话详情、会话列表、SSE（start/delta/done）、raw（snapshot→turn/end）、404（session/agent）、
-跨 key 隔离、异步 runs、usage、metrics。
+跨 key 隔离、列目录、下载、Range、越界 403、伪造链接 403、异步 runs、产物清单、签名链接、usage、metrics。

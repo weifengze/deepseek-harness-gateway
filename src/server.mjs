@@ -13,12 +13,19 @@
 
 import { createServer } from 'node:http'
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
+import { once } from 'node:events'
 import { readFileSync } from 'node:fs'
+import { basename, join } from 'node:path'
 import { ApiError, requestIdOf, sendError, toApiError } from './errors.mjs'
 import { createSession, PresetCatalog, readHistory, runTurn, sessionExists } from './runner.mjs'
 import { SessionLocks, SessionStore } from './sessions.mjs'
 import { UsageStore } from './usage.mjs'
 import { Metrics } from './metrics.mjs'
+import { DeliverableBag } from './deliverables.mjs'
+import {
+  DownloadSigner, FileGuard, FileService, contentDisposition, contentTypeFor, parseRange,
+  randomSigningSecret, toSlashes,
+} from './files.mjs'
 
 // 版本号必须与 package.json 一致：/healthz 与 / 都会回报，
 // 硬编码会在每次发版后立刻与 package.json 脱节。
@@ -32,6 +39,19 @@ const VERSION = (() => {
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 const ASYNC_RUN_TTL_MS = 60 * 60 * 1000
 const ASYNC_RUN_LIMIT = 500
+
+/** 写响应时等一次 drain；连接被对端关掉时立即返回，避免卡在没人读的 socket 上。 */
+function waitForDrain(res) {
+  return new Promise((resolve) => {
+    const done = () => {
+      res.off('drain', done)
+      res.off('close', done)
+      resolve()
+    }
+    res.on('drain', done)
+    res.on('close', done)
+  })
+}
 
 /** 每密钥的滑动窗口限流（次/分钟）。 */
 class RateLimiter {
@@ -178,6 +198,24 @@ function parseMode(stream) {
     'stream 只能是 false / true / "raw"')
 }
 
+/** `?inline=1`：让浏览器直接预览而不是落盘（图片 / PDF 场景）。 */
+function isInline(url) {
+  const value = url.searchParams.get('inline')
+  return value !== null && /^(1|true|yes|inline)$/i.test(value)
+}
+
+/**
+ * 解码一个 URL 段。非法的 `%` 序列是调用方的输入问题（400），
+ * 不该冒成 500 URIError。
+ */
+function decodeSegment(value) {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    throw new ApiError(400, 'invalid_request_error', 'invalid_path', 'URL 里的路径编码非法')
+  }
+}
+
 /** 模型对外标识：`provider/model[:effort]`，与创建会话时接受的写法一致，可原样回传。 */
 function modelLabel(model) {
   if (!model) return undefined
@@ -222,6 +260,9 @@ function routeLabel(path) {
   if (/^\/v1\/sessions\/[^/]+$/.test(path)) return 'sessions.get'
   if (/^\/v1\/sessions\/[^/]+\/messages$/.test(path)) return 'messages'
   if (/^\/v1\/sessions\/[^/]+\/cancel$/.test(path)) return 'sessions.cancel'
+  if (/^\/v1\/sessions\/[^/]+\/files$/.test(path)) return 'files.list'
+  if (/^\/v1\/sessions\/[^/]+\/files\/.+$/.test(path)) return 'files.download'
+  if (/^\/v1\/files\/[^/]+$/.test(path)) return 'files.token'
   if (/^\/v1\/runs\/[^/]+$/.test(path)) return 'runs.get'
   if (/^\/v1\/runs\/[^/]+\/cancel$/.test(path)) return 'runs.cancel'
   return 'other'
@@ -240,6 +281,10 @@ export function createGateway({ config, client, log }) {
   const locks = new SessionLocks()
   const limiter = new RateLimiter()
   const metrics = new Metrics()
+  const files = new FileService({ config: config.files, client, log })
+  // 签名密钥不配就每进程随机：下载链接本来就短命，重启作废是可接受代价。
+  const signer = new DownloadSigner(config.files.signingSecret ?? randomSigningSecret())
+  const filesEnabled = config.files.enabled
   /** 进行中的运行：runId → 控制信息（含 AbortController）。 */
   const activeRuns = new Map()
   /** 异步运行的终态记录：runId → 可查询结果。 */
@@ -354,6 +399,7 @@ export function createGateway({ config, client, log }) {
       agent: agent.id,
       model: modelLabel(agent.effectiveModel),
       modelSource: agent.modelSource ?? 'dsh-default',
+      cwd: agent.cwd,
     })
     return row
   }
@@ -365,7 +411,7 @@ export function createGateway({ config, client, log }) {
     }
   }
 
-  /** 从 session/list 拿标题与运行态；拿不到就降级为空。 */
+  /** 从 session/list 拿标题、工作目录与运行态；拿不到就降级为空。 */
   const sessionSummary = async (sessionId) => {
     try {
       const list = await client.call('session/list', { _request: {} }, { timeoutMs: 15_000 })
@@ -374,6 +420,7 @@ export function createGateway({ config, client, log }) {
       const title = item.projections?.values?.title
       return {
         ...(typeof title === 'string' ? { title } : {}),
+        ...(typeof item.cwd === 'string' && item.cwd.length > 0 ? { cwd: item.cwd } : {}),
         running: item.running === true,
       }
     } catch {
@@ -381,17 +428,224 @@ export function createGateway({ config, client, log }) {
     }
   }
 
-  const sessionObject = (row, summary = {}) => ({
-    object: 'session',
-    id: row.id,
-    agent: row.agent ?? row.app,
-    ...(row.model ? { model: row.model } : {}),
-    ...(row.model ? { model_source: row.modelSource ?? 'session' } : {}),
-    title: summary.title ?? row.title ?? null,
-    created_at: Math.floor(row.createdAt / 1000),
-    last_used_at: Math.floor(row.lastUsedAt / 1000),
-    running: summary.running === true,
-  })
+  const sessionObject = (row, summary = {}) => {
+    const cwd = summary.cwd ?? row.cwd
+    return {
+      object: 'session',
+      id: row.id,
+      agent: row.agent ?? row.app,
+      ...(row.model ? { model: row.model } : {}),
+      ...(row.model ? { model_source: row.modelSource ?? 'session' } : {}),
+      // 工作目录就是下载接口的可见范围，直接回给调用方，省得它去猜。
+      ...(typeof cwd === 'string' && cwd.length > 0 ? { cwd } : {}),
+      title: summary.title ?? row.title ?? null,
+      created_at: Math.floor(row.createdAt / 1000),
+      last_used_at: Math.floor(row.lastUsedAt / 1000),
+      running: summary.running === true,
+    }
+  }
+
+  const assertFilesEnabled = () => {
+    if (!filesEnabled) {
+      throw new ApiError(404, 'not_found_error', 'files_disabled',
+        '本部署未开启文件下载（files.enabled=false）')
+    }
+  }
+
+  /**
+   * 会话的允许根目录。
+   *
+   * 建会话时 agent 声明了 cwd 就已记录；没声明（走 DSH 默认）时从 `session/list`
+   * 的 header 里反查一次并写回档案。查不到就不猜——宁可 409，也不要退化成「整机可读」。
+   */
+  const guardFor = async (row) => {
+    let cwd = typeof row?.cwd === 'string' && row.cwd.length > 0 ? row.cwd : undefined
+    if (cwd === undefined && row?.id) {
+      try {
+        const list = await client.call('session/list', { _request: {} }, { timeoutMs: 15_000 })
+        const item = (list?.items ?? []).find(entry => entry.sessionId === row.id)
+        if (typeof item?.cwd === 'string' && item.cwd.length > 0) {
+          cwd = item.cwd
+          store.setCwd(row.id, cwd)
+        }
+      } catch {
+        // 拿不到就落到下面的 409：下载失败比给出一个更宽的范围安全。
+      }
+    }
+    const guard = new FileGuard({ cwd, roots: config.files.roots })
+    if (guard.roots.length === 0) {
+      throw new ApiError(409, 'conflict_error', 'session_cwd_unknown',
+        `会话 ${row?.id ?? ''} 没有可用的工作目录，无法确定文件范围；`
+        + '请给 agent 配置 cwd，或在 files.roots 里列出允许访问的目录')
+    }
+    return guard
+  }
+
+  /**
+   * 把本轮产物变成可下载条目。
+   *
+   * 单个文件出问题不影响整轮：标 `downloadable:false` + 原因，
+   * 而不是让「模型答得好、但顺带的附件越界」把整个回复变成 500。
+   */
+  const materializeFiles = async ({ row, items, keyId }) => {
+    if (!filesEnabled || items.length === 0) return []
+    let guard
+    try {
+      guard = await guardFor(row)
+    } catch (error) {
+      const apiError = toApiError(error)
+      return items.map(item => ({
+        object: 'file',
+        name: basename(toSlashes(item.path)) || toSlashes(item.path),
+        path: toSlashes(item.path),
+        source: item.source,
+        ...(item.description ? { description: item.description } : {}),
+        downloadable: false,
+        download_error: apiError.code,
+      }))
+    }
+    const expiresAt = Math.floor((Date.now() + config.files.tokenTtlMs) / 1000)
+    const out = []
+    for (const item of items) {
+      const fallbackName = basename(toSlashes(item.path)) || toSlashes(item.path)
+      try {
+        const target = guard.resolve(item.path)
+        const info = await files.stat({ sessionId: row.id, cwd: guard.cwd, path: target })
+        const canonical = typeof info.absolutePath === 'string' && info.absolutePath.length > 0
+          ? info.absolutePath
+          : target
+        // 词法合法不等于真实合法：符号链接可能指到允许范围之外，用 reader 的 canonical 路径复核。
+        guard.assertAllowed(canonical)
+        const name = basename(toSlashes(canonical)) || fallbackName
+        const token = signer.sign({ s: row.id, p: canonical, k: keyId, n: name }, config.files.tokenTtlMs)
+        out.push({
+          object: 'file',
+          name,
+          path: guard.display(canonical),
+          source: item.source,
+          ...(item.description ? { description: item.description } : {}),
+          ...(typeof info.size === 'number' ? { size: info.size } : {}),
+          content_type: contentTypeFor(name),
+          downloadable: true,
+          download_url: `${config.files.publicBaseUrl ?? ''}/v1/files/${token}`,
+          expires_at: expiresAt,
+        })
+      } catch (error) {
+        const apiError = toApiError(error)
+        out.push({
+          object: 'file',
+          name: fallbackName,
+          path: toSlashes(item.path),
+          source: item.source,
+          ...(item.description ? { description: item.description } : {}),
+          downloadable: false,
+          download_error: apiError.code,
+        })
+      }
+    }
+    return out
+  }
+
+  /**
+   * 投递一个文件：Bearer 路由与签名链接共用同一条路径。
+   *
+   * 顺序是固定的——解析 → 词法护栏 → stat → canonical 复核 → 流式写。
+   * 任何一步失败都在写响应头之前结束，不会出现「半个文件」。
+   */
+  const serveFile = async ({ req, res, requestId, row, requestPath, keyId, inline }) => {
+    const guard = await guardFor(row)
+    const target = guard.resolve(requestPath)
+    const info = await files.stat({ sessionId: row.id, cwd: guard.cwd, path: target })
+    const canonical = typeof info.absolutePath === 'string' && info.absolutePath.length > 0 ? info.absolutePath : target
+    guard.assertAllowed(canonical)
+
+    const name = basename(toSlashes(canonical)) || 'download'
+    const size = typeof info.size === 'number' ? info.size : undefined
+    const etag = info.version ? `"${info.version}"` : undefined
+
+    if (etag !== undefined && req.headers['if-none-match'] === etag) {
+      res.writeHead(304, { etag, 'x-request-id': requestId })
+      res.end()
+      return
+    }
+
+    const range = parseRange(req.headers.range, size)
+    if (range !== undefined && range.invalid) {
+      const body = Buffer.from(JSON.stringify({
+        error: { code: 'invalid_range', message: `Range 无法满足（文件大小 ${size ?? '未知'}）` },
+      }))
+      res.writeHead(416, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-length': body.length,
+        'content-range': `bytes */${size ?? '*'}`,
+        'x-request-id': requestId,
+      })
+      res.end(body)
+      return
+    }
+
+    const headers = {
+      'content-type': contentTypeFor(name),
+      'content-disposition': contentDisposition(name, { inline }),
+      'cache-control': 'private, max-age=0, must-revalidate',
+      'accept-ranges': 'bytes',
+      'x-request-id': requestId,
+      ...(etag ? { etag } : {}),
+    }
+    if (range) {
+      headers['content-range'] = `bytes ${range.offset}-${range.offset + range.length - 1}/${size}`
+      headers['content-length'] = String(range.length)
+    } else if (size !== undefined) {
+      headers['content-length'] = String(size)
+    }
+    res.writeHead(range ? 206 : 200, headers)
+
+    let closed = false
+    let written = 0
+    const expected = range ? range.length : size
+    const onClose = () => { closed = true }
+    res.on('close', onClose)
+    try {
+      for await (const chunk of files.chunks({
+        sessionId: row.id,
+        cwd: guard.cwd,
+        path: canonical,
+        offset: range?.offset ?? 0,
+        length: range?.length,
+      })) {
+        if (closed || res.writableEnded || res.destroyed) break
+        written += chunk.length
+        if (!res.write(chunk)) await waitForDrain(res)
+      }
+      // 客户端可能在收到最后一个字节的同一瞬间断开（curl 就是这样），
+      // 所以「close 过」不等于「没送完」：用「承诺的字节数是否都写出去」判定结果。
+      const delivered = expected === undefined ? !closed : written >= expected
+      metrics.inc('dsh_gateway_files_total', {
+        kind: 'download',
+        outcome: delivered ? 'ok' : closed ? 'aborted' : 'failed',
+      })
+      if (delivered) {
+        log('info', 'file.served', {
+          request_id: requestId, key: keyId, session: row.id, name,
+          bytes: written, range: range ? `${range.offset}+${range.length}` : 'full',
+        })
+      }
+    } catch (error) {
+      // 头已经发出去了，改不了状态码。此时**不能**安静地 end()——
+      // 那会让调用方拿到一个「200 + 短读」的文件，比失败更难查。
+      const apiError = toApiError(error)
+      metrics.inc('dsh_gateway_files_total', { kind: 'download', outcome: 'failed' })
+      log('warn', 'file.stream.failed', {
+        request_id: requestId, key: keyId, session: row.id, name,
+        code: apiError.code, message: apiError.message,
+      })
+      res.destroy()
+      return
+    } finally {
+      res.off('close', onClose)
+      if (!res.writableEnded && !res.destroyed) res.end()
+    }
+  }
 
   /** 构造本轮内容块：input + 模板变量 + 内联图片。 */
   const buildContent = (agent, body) => {
@@ -441,24 +695,31 @@ export function createGateway({ config, client, log }) {
 
   /**
    * 执行一轮并记录计量；抛出的错误由调用方决定如何回给客户端。
+   *
+   * 产物收集挂在本轮的事件流上（`onEvent` 只在本轮认领之后回调）。
+   * 回合结束后**先放掉会话锁**再 stat + 签链接：给产物补元数据是多出来的 RPC，
+   * 不该让同会话的下一轮排在它后面。
    */
-  const executeRun = async ({ key, agent, sessionId, content, controller, timeoutMs, onDelta }) => {
+  const executeRun = async ({ key, agent, sessionId, row, content, controller, timeoutMs, onDelta }) => {
     const releaseLock = await locks.acquire(sessionId)
     const startedAt = Date.now()
+    const bag = new DeliverableBag({ includeWritten: config.files.includeWritten })
+    let result
+    let metadata
     try {
-      const result = await runTurn({
+      result = await runTurn({
         client,
         sessionId,
         content,
         signal: controller.signal,
         timeoutMs,
         onDelta,
+        onEvent: event => bag.observe(event),
       })
-      const metadata = runMetadata(agent, result, startedAt)
+      metadata = runMetadata(agent, result, startedAt)
       recordUsage(key, result.usage)
       metrics.inc('dsh_gateway_runs_total', { agent: agent.id, outcome: 'succeeded' })
       metrics.observeMilliseconds('dsh_gateway_run_duration', { agent: agent.id }, metadata.elapsed_ms)
-      return { result, metadata }
     } catch (error) {
       metrics.inc('dsh_gateway_runs_total', {
         agent: agent.id,
@@ -468,6 +729,8 @@ export function createGateway({ config, client, log }) {
     } finally {
       releaseLock()
     }
+    const turnFiles = await materializeFiles({ row, items: bag.list(), keyId: key.id })
+    return { result, metadata, files: turnFiles }
   }
 
   const json = (res, status, payload, requestId) => {
@@ -656,6 +919,7 @@ export function createGateway({ config, client, log }) {
           key,
           agent,
           sessionId,
+          row,
           content,
           controller,
           timeoutMs,
@@ -708,6 +972,7 @@ export function createGateway({ config, client, log }) {
           message_id: messageId,
           content: outcome.result.answer,
           ...outcome.metadata,
+          ...(outcome.files.length > 0 ? { files: outcome.files } : {}),
         })
         channel.close()
       } else {
@@ -719,6 +984,7 @@ export function createGateway({ config, client, log }) {
           content: outcome.result.answer,
           created_at: createdAt,
           ...outcome.metadata,
+          ...(outcome.files.length > 0 ? { files: outcome.files } : {}),
         }, requestId)
       }
       log('info', 'run.completed', {
@@ -781,6 +1047,8 @@ export function createGateway({ config, client, log }) {
     const key = authenticate(req)
     const row = store.assertOwner(sessionId, key)
     const summary = await sessionSummary(sessionId)
+    // 顺手补上档案里缺的 cwd：之后下载不必每次都去问 DSH。
+    if (summary.cwd !== undefined) store.setCwd(row.id, summary.cwd)
     json(res, 200, sessionObject(row, summary), requestId)
   }
 
@@ -843,6 +1111,73 @@ export function createGateway({ config, client, log }) {
       }
     }
     json(res, 200, { object: 'list', data, has_more: false }, requestId)
+  }
+
+  /**
+   * GET /v1/sessions/{id}/files?path=&limit=
+   *
+   * 浏览会话工作目录（默认根目录）。`path` 相对则按 cwd 解析，绝对则必须落在允许范围内。
+   */
+  const handleListFiles = async (req, res, requestId, url, sessionId) => {
+    const key = authenticate(req)
+    const row = store.assertOwner(sessionId, key)
+    assertFilesEnabled()
+    const guard = await guardFor(row)
+    const requested = url.searchParams.get('path')
+    const rawLimit = Number(url.searchParams.get('limit') ?? '200')
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 1000) : 200
+    const dir = guard.resolve(requested === null || requested === '' ? '.' : requested)
+    const listing = await files.list({ sessionId, cwd: guard.cwd, path: dir, limit })
+    const data = listing.entries.map(entry => ({
+      object: 'file',
+      name: entry.name,
+      path: guard.display(join(dir, entry.name)),
+      type: entry.type,
+      ...(entry.size === undefined ? {} : { size: entry.size }),
+    }))
+    metrics.inc('dsh_gateway_files_total', { kind: 'list', outcome: 'ok' })
+    json(res, 200, {
+      object: 'list',
+      data,
+      path: guard.display(dir),
+      truncated: listing.truncated === true,
+    }, requestId)
+  }
+
+  /** GET /v1/sessions/{id}/files/{path}：Bearer 鉴权 + 归属校验。 */
+  const handleDownloadFile = async (req, res, requestId, url, sessionId, rawPath) => {
+    const key = authenticate(req)
+    const row = store.assertOwner(sessionId, key)
+    assertFilesEnabled()
+    await serveFile({
+      req, res, requestId, row, requestPath: rawPath, keyId: key.id, inline: isInline(url),
+    })
+  }
+
+  /**
+   * GET /v1/files/{token}：链接本身就是授权。
+   *
+   * 令牌绑定「会话 + 绝对路径 + key + 过期时间」，所以可以安全地交给浏览器直接点；
+   * 这里仍然重新走一遍护栏——链接签发之后 `files.roots` 可能被收紧过。
+   */
+  const handleSignedDownload = async (req, res, requestId, url, token) => {
+    assertFilesEnabled()
+    const payload = signer.verify(token)
+    if (!payload) {
+      throw new ApiError(403, 'permission_error', 'invalid_signature', '下载链接无效或已过期')
+    }
+    const key = config.auth.keys.find(item => item.id === payload.k)
+    if (!key) {
+      throw new ApiError(404, 'not_found_error', 'file_not_found', '下载链接对应的密钥已不存在')
+    }
+    const row = store.get(payload.s)
+    // 与「不存在」统一成 404：不确认某个 session id 是否曾经存在。
+    if (!row || (!key.admin && row.keyId !== key.id)) {
+      throw new ApiError(404, 'not_found_error', 'session_not_found', `session ${payload.s} 不存在`)
+    }
+    await serveFile({
+      req, res, requestId, row, requestPath: payload.p, keyId: key.id, inline: isInline(url),
+    })
   }
 
   /** GET /v1/agents */
@@ -923,9 +1258,10 @@ export function createGateway({ config, client, log }) {
 
     let agent
     let content
+    let row
     try {
       if (sessionId) {
-        const row = store.assertOwner(sessionId, key)
+        row = store.assertOwner(sessionId, key)
         agent = withStoredModel(resolveAgent(key, row.agent ?? row.app), row)
         content = buildContent(agent, body)
         await assertSessionAlive(sessionId)
@@ -936,7 +1272,8 @@ export function createGateway({ config, client, log }) {
         }
         agent = withModelOverride(resolveAgent(key, body.agent), body.model)
         content = buildContent(agent, body)
-        sessionId = (await openSession(key, agent)).id
+        row = await openSession(key, agent)
+        sessionId = row.id
       }
     } catch (error) {
       releaseSlot()
@@ -971,15 +1308,16 @@ export function createGateway({ config, client, log }) {
     setImmediate(() => {
       record.status = 'running'
       record.started_at = Date.now()
-      void executeRun({ key, agent, sessionId, content, controller, timeoutMs })
-        .then(({ result, metadata }) => {
+      void executeRun({ key, agent, sessionId, row, content, controller, timeoutMs })
+        .then(({ result, metadata, files: turnFiles }) => {
           record.status = 'succeeded'
           record.content = result.answer
           record.metadata = metadata
+          if (turnFiles.length > 0) record.files = turnFiles
           record.finished_at = Date.now()
           log('info', 'run.async.succeeded', {
             request_id: requestId, key: key.id, agent: agent.id, session: sessionId,
-            run: runId, ms: metadata.elapsed_ms,
+            run: runId, ms: metadata.elapsed_ms, files: turnFiles.length,
           })
         })
         .catch((error) => {
@@ -1019,6 +1357,7 @@ export function createGateway({ config, client, log }) {
       ...(record.started_at ? { started_at: Math.floor(record.started_at / 1000) } : {}),
       ...(record.finished_at ? { finished_at: Math.floor(record.finished_at / 1000) } : {}),
       ...(record.content !== undefined ? { content: record.content } : {}),
+      ...(record.files !== undefined ? { files: record.files } : {}),
       ...(record.metadata ? { metadata: record.metadata } : {}),
       ...(record.error ? { error: record.error } : {}),
     }, requestId)
@@ -1111,6 +1450,9 @@ export function createGateway({ config, client, log }) {
             'POST /v1/sessions/{id}/cancel',
             'POST /v1/sessions/{id}/messages          { input, stream?: false|true|"raw" }',
             'GET  /v1/sessions/{id}/messages?limit=',
+            'GET  /v1/sessions/{id}/files?path=&limit=',
+            'GET  /v1/sessions/{id}/files/{path}       (?inline=1)',
+            'GET  /v1/files/{token}                    签名链接，免 Bearer',
             'POST /v1/runs                            { agent?, session_id?, input }',
             'GET  /v1/runs/{id}',
             'POST /v1/runs/{id}/cancel',
@@ -1127,29 +1469,47 @@ export function createGateway({ config, client, log }) {
 
       let match = /^\/v1\/sessions\/([^/]+)\/messages$/.exec(path)
       if (match) {
-        const sessionId = decodeURIComponent(match[1])
+        const sessionId = decodeSegment(match[1])
         if (req.method === 'POST') return await handleCreateMessage(req, res, requestId, sessionId)
         if (req.method === 'GET') return await handleMessages(req, res, requestId, url, sessionId)
       }
 
       match = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path)
       if (req.method === 'POST' && match) {
-        return await handleCancelSession(req, res, requestId, decodeURIComponent(match[1]))
+        return await handleCancelSession(req, res, requestId, decodeSegment(match[1]))
+      }
+
+      // 文件：先精确匹配目录列举，再匹配带路径的下载。
+      match = /^\/v1\/sessions\/([^/]+)\/files$/.exec(path)
+      if (req.method === 'GET' && match) {
+        return await handleListFiles(req, res, requestId, url, decodeSegment(match[1]))
+      }
+
+      match = /^\/v1\/sessions\/([^/]+)\/files\/(.+)$/.exec(path)
+      if (req.method === 'GET' && match) {
+        return await handleDownloadFile(
+          req, res, requestId, url, decodeSegment(match[1]), decodeSegment(match[2]),
+        )
+      }
+
+      match = /^\/v1\/files\/([^/]+)$/.exec(path)
+      if (req.method === 'GET' && match) {
+        return await handleSignedDownload(req, res, requestId, url, decodeSegment(match[1]))
       }
 
       match = /^\/v1\/sessions\/([^/]+)$/.exec(path)
       if (req.method === 'GET' && match) {
-        return await handleGetSession(req, res, requestId, decodeURIComponent(match[1]))
+        return await handleGetSession(req, res, requestId, decodeSegment(match[1]))
       }
 
       match = /^\/v1\/runs\/([^/]+)\/cancel$/.exec(path)
       if (req.method === 'POST' && match) {
-        return await handleCancelRun(req, res, requestId, decodeURIComponent(match[1]))
+        return await handleCancelRun(req, res, requestId, decodeSegment(match[1]))
       }
 
       match = /^\/v1\/runs\/([^/]+)$/.exec(path)
       if (req.method === 'GET' && match) {
-        return await handleGetRun(req, res, requestId, decodeURIComponent(match[1]))
+        return await handleGetRun(req, res, requestId, decodeSegment(match[1]))
       }
 
       throw new ApiError(404, 'not_found_error', 'route_not_found', `没有这个接口: ${req.method} ${path}`)
