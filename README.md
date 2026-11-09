@@ -5,6 +5,8 @@
 不是 Dify 适配层，也不是 OpenAI 兼容层：资源只有 `agent` / `session` / `message` / `run` 四类，
 字段扁平、语义直给。任何语言、任何框架按这四类资源调用即可。
 
+每个版本的变更见 [`CHANGELOG.md`](CHANGELOG.md)。
+
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/sessions \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
@@ -36,7 +38,7 @@ DSH 仓库里的 `docs/api-gateway.zh.md` 讲的是 **Host ↔ Client 之间的�
 ```
 
 网关只做四件事：**鉴权、资源抽象、事件投影、租户与限额**（外加把产物文件递出去）。
-核心约 4400 行（`src/`），零运行时依赖。
+核心约 5000 行（`src/`），零运行时依赖。
 
 ### 0.1 两种运行形态
 

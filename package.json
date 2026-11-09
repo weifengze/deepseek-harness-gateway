@@ -31,7 +31,8 @@
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
-    "scripts/test-questions.mjs"
+    "scripts/test-questions.mjs",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "start": "node src/index.mjs",
