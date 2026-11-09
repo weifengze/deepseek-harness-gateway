@@ -2,14 +2,14 @@
 #
 # 形态 B：DSH + 网关同容器（一体化）。适合"一台机器就是一个 Agent 服务"的场景。
 #
-#   docker build -f docker/Dockerfile.allinone -t dsh-allinone:0.4.1 .
+#   docker build -f docker/Dockerfile.allinone -t dsh-allinone:0.5.0 .
 #   docker run -d --name dsh \
 #     -p 8787:8787 \
 #     -e DEEPSEEK_API_KEY=sk-... \
 #     -v dsh-home:/home/dsh/.dsh \
 #     -v dsh-state:/var/lib/dsh-gateway \
 #     -v /srv/tenants:/workspace \
-#     dsh-allinone:0.4.1
+#     dsh-allinone:0.5.0
 #
 # ⚠️ 容器内 bwrap 需要宿主放行 user namespace，否则入口会退化为 danger-full-access
 #    （边界退化为容器本身）。细节见 docs/docker.md。
@@ -17,7 +17,7 @@
 ARG NODE_IMAGE=node:24-bookworm-slim
 
 FROM ${NODE_IMAGE}
-ARG GATEWAY_VERSION=0.4.1
+ARG GATEWAY_VERSION=0.5.0
 ARG DSH_VERSION=0.2.2-rc.1
 
 LABEL org.opencontainers.image.title="dsh-allinone" \

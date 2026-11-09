@@ -11,7 +11,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.allinone
-    image: dsh-allinone:0.4.1
+    image: dsh-allinone:0.5.0
     restart: unless-stopped
     ports:
       - "127.0.0.1:8787:8787"      # 默认只绑回环；对外请走 nginx TLS
@@ -41,7 +41,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
-    image: dsh-gateway:0.4.1
+    image: dsh-gateway:0.5.0
     restart: unless-stopped
     ports:
       - "127.0.0.1:8788:8787"
