@@ -8,7 +8,7 @@
     "node": ">=22.19.0"
   },
   "bin": {
-    "dsh-gateway": "./src/index.mjs"
+    "dsh-gateway": "src/index.mjs"
   },
   "exports": {
     "./client": "./src/dsh-client.mjs",
