@@ -716,7 +716,7 @@ sequenceDiagram
 > 同一次验证的完整记录见 [`docs/test-report-linux-2026-11-06.md`](docs/test-report-linux-2026-11-06.md)（33 项用例 / 5 个缺陷）。
 >
 > **Docker 部署**见 [`docs/docker.md`](docs/docker.md)：两种镜像（网关独占 331 MB / 一体化 1.48 GB），
-> 含容器内沙箱权限矩阵与实测结果。构建：`docker build -f docker/Dockerfile.allinone -t dsh-allinone:0.4.1 .`
+> 含容器内沙箱权限矩阵与实测结果。构建：`docker build -f docker/Dockerfile.allinone -t dsh-allinone:0.5.0 .`
 
 ### 10.1 作为 DSH 插件安装（单机形态，推荐）
 

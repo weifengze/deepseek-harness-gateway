@@ -16,7 +16,7 @@
 ## 1. 形态 A：网关独占
 
 ```bash
-docker build -f docker/Dockerfile.gateway -t dsh-gateway:0.4.1 .
+docker build -f docker/Dockerfile.gateway -t dsh-gateway:0.5.0 .
 ```
 
 DSH 在外（宿主机或另一台机器）。容器需要两样东西：**可达的 baseUrl** 和**启动令牌文件**。
@@ -28,7 +28,7 @@ docker run -d --name dsh-gateway -p 8787:8787 \
   -e DSH_GATEWAY_API_KEYS='prod:<至少16位随机串>' \
   -e DSH_GATEWAY_AGENTS='[{"id":"assistant","preset":"standard","cwd":"/srv/dsh/tenants/acme"}]' \
   -v /var/lib/dsh-gateway:/var/lib/dsh-gateway:ro \
-  dsh-gateway:0.4.1
+  dsh-gateway:0.5.0
 ```
 
 要点：
@@ -43,7 +43,7 @@ docker run -d --name dsh-gateway -p 8787:8787 \
 ## 2. 形态 B：一体化
 
 ```bash
-docker build -f docker/Dockerfile.allinone -t dsh-allinone:0.4.1 .
+docker build -f docker/Dockerfile.allinone -t dsh-allinone:0.5.0 .
 ```
 
 ```bash
@@ -53,7 +53,7 @@ docker run -d --name dsh -p 127.0.0.1:8787:8787 \
   -v dsh-home:/home/dsh/.dsh \
   -v dsh-state:/var/lib/dsh-gateway \
   -v /srv/tenants/acme:/workspace \
-  dsh-allinone:0.4.1
+  dsh-allinone:0.5.0
 ```
 
 第一次启动会打印一次性 key（`docker logs dsh | grep 一次性`），重启会变。生产请显式传：

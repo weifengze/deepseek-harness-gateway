@@ -330,7 +330,7 @@ sudo systemctl enable --now dsh.service dsh-gateway.service
 ```bash
 KEY=<你的 key>
 curl -s http://127.0.0.1:8787/healthz
-# {"status":"ok","version":"0.4.1","dsh":{"reachable":true,"presets":4,"base_url":"http://127.0.0.1:3080"}}
+# {"status":"ok","version":"0.5.0","dsh":{"reachable":true,"presets":4,"base_url":"http://127.0.0.1:3080"}}
 
 curl -s http://127.0.0.1:8787/v1/models -H "Authorization: Bearer $KEY"
 curl -s http://127.0.0.1:8787/v1/agents -H "Authorization: Bearer $KEY"
