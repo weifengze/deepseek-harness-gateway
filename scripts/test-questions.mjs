@@ -6,7 +6,9 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { QuestionBroker, normalizeAnswers } from '../src/questions.mjs'
+import {
+  QuestionBroker, answerTimedQuestion, mapTimedQuestions, normalizeAnswers, readTimedQuestions,
+} from '../src/questions.mjs'
 
 let passed = 0
 let failed = 0
@@ -133,8 +135,115 @@ async function testBroker() {
 async function main() {
   testNormalize()
   await testBroker()
+  await testTimed()
   console.log(`\n${passed} 项通过${failed > 0 ? `，${failed} 项失败` : ''}`)
   if (failed > 0) process.exitCode = 1
+}
+
+/** timed：callId 贯穿「窗口内」与「超时后补答」两个阶段。 */
+async function testTimed() {
+  // 1) 窗口内：请求里带 wait.callId，broker 就用它当 id，调用方不必换标识。
+  const broker = new QuestionBroker({ waitMs: 5_000 })
+  const waiter = broker.open({ sessionId: 'session-1', questions, eventId: 'evt-1', callId: 'call-abc' })
+  check('timed 窗口内用 callId 当 id', waiter.id === 'call-abc'
+    && broker.list('session-1')[0].call_id === 'call-abc'
+    && broker.list('session-1')[0].state === 'open')
+  broker.answer('call-abc', [{ id: 'q1', selected: ['A'] }, { id: 'q2', selected: [] }], 'session-1')
+  check('timed 窗口内答案正常落地', (await waiter.promise)?.answers?.length === 2)
+  broker.close()
+
+  // 2) 投影视图：只有 continued 可补答，open 不算。
+  const projection = {
+    asOfSeq: 12,
+    values: {
+      userQuestions: {
+        timed: true,
+        active: [
+          { callId: 'call-open', state: 'open', questions: [{ id: 'q1', question: '进行中' }] },
+          {
+            callId: 'call-late',
+            state: 'continued',
+            questions: [{ id: 'q1', question: '选 A 还是 B', multiSelect: false, options: [{ label: 'A' }, { label: 'B' }] }],
+          },
+        ],
+        settled: [],
+      },
+    },
+  }
+  const mapped = mapTimedQuestions(projection)
+  check('只挑 continued 的问题', mapped.length === 1 && mapped[0].call_id === 'call-late')
+  check('投影问题转成下划线形状', mapped[0].questions[0].multi_select === false
+    && mapped[0].questions[0].options.length === 2)
+  check('无投影时返回空数组', mapTimedQuestions(undefined).length === 0
+    && mapTimedQuestions({ values: {} }).length === 0)
+
+  // 3) 补答：读投影 → 校验 → 调 userQuestions/answer。
+  const calls = []
+  const fake = {
+    async call(endpoint, args) {
+      calls.push({ endpoint, args })
+      if (endpoint === 'session/projections') return projection
+      throw new Error(`未预期的调用 ${endpoint}`)
+    },
+    async answerQuestion(request) {
+      calls.push({ endpoint: 'userQuestions/answer', args: request })
+      return true
+    },
+  }
+  const listed = await readTimedQuestions({ client: fake, sessionId: 'session-9' })
+  check('readTimedQuestions 走 session/projections',
+    calls[0]?.endpoint === 'session/projections' && calls[0].args.request.sessionId === 'session-9'
+      && listed.length === 1)
+
+  const late = await answerTimedQuestion({
+    client: fake, sessionId: 'session-9', callId: 'call-late',
+    answers: [{ id: 'q1', selected: ['B'] }],
+  })
+  const sent = calls.find(c => c.endpoint === 'userQuestions/answer')
+  // 这里断言的是「中枢传了什么」；`sessionId → agentId` 的线级改名发生在 DshClient.answerQuestion。
+  check('补答发到 userQuestions/answer 且带 callId',
+    late.mode === 'late' && sent.args.sessionId === 'session-9' && sent.args.callId === 'call-late'
+      && sent.args.answer.answers[0].selected[0] === 'B')
+
+  // 4) 校验仍然生效：选项不存在要拒，且不能把无效答案发给 DSH。
+  let rejected = false
+  try {
+    await answerTimedQuestion({
+      client: fake, sessionId: 'session-9', callId: 'call-late',
+      answers: [{ id: 'q1', selected: ['Z'] }],
+    })
+  } catch (error) {
+    rejected = error?.code === 'unknown_option'
+  }
+  check('补答前仍然校验选项', rejected)
+
+  // 5) callId 不在投影里 → 409，而不是静默成功。
+  let missing = false
+  try {
+    await answerTimedQuestion({
+      client: fake, sessionId: 'session-9', callId: 'call-nope',
+      answers: [{ id: 'q1', selected: ['A'] }],
+    })
+  } catch (error) {
+    missing = error?.code === 'question_not_pending'
+  }
+  check('未知 callId 补答被拒', missing)
+
+  // 6) DSH 说 false（已结算过）→ question_not_answerable。
+  const refusing = {
+    async call() { return projection },
+    async answerQuestion() { return false },
+  }
+  let refusingCode
+  try {
+    await answerTimedQuestion({
+      client: refusing, sessionId: 'session-9', callId: 'call-late',
+      answers: [{ id: 'q1', selected: ['A'] }],
+    })
+  } catch (error) {
+    refusingCode = error?.code
+  }
+  check('DSH 拒收时回 question_not_answerable', refusingCode === 'question_not_answerable', refusingCode)
 }
 
 await main()

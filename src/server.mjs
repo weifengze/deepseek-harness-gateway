@@ -22,7 +22,7 @@ import { SessionLocks, SessionStore } from './sessions.mjs'
 import { UsageStore } from './usage.mjs'
 import { Metrics } from './metrics.mjs'
 import { DeliverableBag } from './deliverables.mjs'
-import { QuestionBroker } from './questions.mjs'
+import { QuestionBroker, answerTimedQuestion, readTimedQuestions } from './questions.mjs'
 import {
   DownloadSigner, FileGuard, FileService, contentDisposition, contentTypeFor, parseRange,
   randomSigningSecret, toSlashes,
@@ -1104,10 +1104,31 @@ export function createGateway({ config, client, log }) {
   const handleListQuestions = async (req, res, requestId, sessionId) => {
     const key = authenticate(req)
     const row = store.assertOwner(sessionId, key)
-    const rows = questions.list(row.id)
+    const live = questions.list(row.id)
+    // 窗口内的问题在 broker 里；timed 超时后的在会话投影里。两段用同一个 id（callId）串起来。
+    let late = []
+    if (questionsEnabled) {
+      try {
+        const rows = await readTimedQuestions({ client, sessionId: row.id })
+        const known = new Set(live.map(item => item.id))
+        late = rows
+          .filter(item => !known.has(item.id))
+          .map(item => ({
+            id: item.id,
+            call_id: item.call_id,
+            session_id: row.id,
+            state: item.state,
+            questions: item.questions,
+            can_answer_late: true,
+          }))
+      } catch (error) {
+        // 投影读不到不该让列表变 500：窗口内的表单仍然有价值。
+        log('warn', 'questions.projection.failed', { session: row.id, error: error.message })
+      }
+    }
     json(res, 200, {
       object: 'list',
-      data: rows,
+      data: [...live, ...late],
       has_more: false,
       ...(questionsEnabled ? {} : { note: 'questions.enabled=false：提问会被直接放行，工具以 NO_PROVIDER 失败' }),
     }, requestId)
@@ -1115,6 +1136,9 @@ export function createGateway({ config, client, log }) {
 
   /**
    * POST /v1/sessions/{id}/questions/{questionId}/answer
+   *
+   * `questionId` 可以是窗口内的 id（legacy 的 `q_...` 或 timed 的 callId），
+   * 也可以是 timed 超时后投影里的 callId —— 两条路自动选：先找 broker，找不到就补答。
    *
    * body 二选一：
    *   `{ "answers": [{ "id": "q1", "selected": ["A"] }, ...] }` —— 逐个问题回答
@@ -1140,12 +1164,26 @@ export function createGateway({ config, client, log }) {
       json(res, 200, { object: 'question', id: questionId, session_id: row.id, declined: true }, requestId)
       return
     }
-    const result = questions.answer(questionId, body.answers ?? [], row.id)
+    try {
+      const result = questions.answer(questionId, body.answers ?? [], row.id)
+      log('info', 'question.answered', {
+        request_id: requestId, key: key.id, session: row.id, question: questionId, mode: 'live',
+        count: Array.isArray(body.answers) ? body.answers.length : 0,
+      })
+      json(res, 200, { object: 'question', ...result, mode: 'live', declined: false }, requestId)
+      return
+    } catch (error) {
+      // 只有「不在窗口内」才值得再试补答；答案形状错误要原样抛给调用方。
+      if (!(error instanceof ApiError) || error.code !== 'question_not_pending') throw error
+    }
+    const late = await answerTimedQuestion({
+      client, sessionId: row.id, callId: questionId, answers: body.answers ?? [],
+    })
     log('info', 'question.answered', {
-      request_id: requestId, key: key.id, session: row.id, question: questionId,
+      request_id: requestId, key: key.id, session: row.id, question: questionId, mode: 'late',
       count: Array.isArray(body.answers) ? body.answers.length : 0,
     })
-    json(res, 200, { object: 'question', ...result, declined: false }, requestId)
+    json(res, 200, { object: 'question', ...late, declined: false }, requestId)
   }
 
   /** POST /v1/sessions/{id}/cancel：按会话取消，不必先记住 message_id。 */

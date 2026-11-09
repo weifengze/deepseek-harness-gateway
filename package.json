@@ -1,7 +1,7 @@
 {
   "name": "deepseek-harness-gateway",
-  "version": "0.6.0",
-  "description": "HTTP API for DeepSeek Harness: install as a dsh plugin bundle or run standalone, then call your configured agents through agents / sessions / messages / runs / files, with SSE streaming, raw event passthrough, async runs, downloadable deliverables, per-key metering and tenant isolation.",
+  "version": "0.7.0",
+  "description": "HTTP API for DeepSeek Harness: agents / sessions / messages / runs / files / questions, with SSE streaming, raw event passthrough, async runs, downloadable deliverables, answerable prompts (legacy + timed), per-key metering and tenant isolation.",
   "type": "module",
   "license": "MIT",
   "engines": {

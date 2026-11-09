@@ -103,7 +103,9 @@ export function normalizeAnswers(questions, answers) {
 function project(entry) {
   return {
     id: entry.id,
+    ...(entry.callId !== undefined ? { call_id: entry.callId } : {}),
     session_id: entry.sessionId,
+    state: 'open',
     questions: entry.questions.map(question => ({
       id: question.id,
       question: question.question,
@@ -114,6 +116,83 @@ function project(entry) {
     created_at: Math.floor(entry.createdAt / 1000),
     expires_at: Math.floor(entry.expiresAt / 1000),
   }
+}
+
+/** DSH 的 `AskUserQuestionItem` → 网关的下划线形状。 */
+function projectQuestion(question) {
+  return {
+    id: question.id,
+    question: question.question,
+    ...(question.header !== undefined ? { header: question.header } : {}),
+    ...(Array.isArray(question.options) ? { options: question.options } : {}),
+    ...(question.multiSelect !== undefined ? { multi_select: question.multiSelect } : {}),
+  }
+}
+
+/**
+ * 从 `session/projections` 的 `userQuestions` 视图里取出「还能补答」的问题。
+ *
+ * 只有 `state: 'continued'` 可补答——它表示那次调用已经以 pending 结束（timed 超时），
+ * 答案会作为一条 `user-question-reply` 用户消息 steer 回会话。
+ * `state: 'open'` 是调用还在前台等，只能走 waterfall（broker 那条路）。
+ *
+ * @param {unknown} value `session/projections` 的返回值
+ * @returns {{id: string, call_id: string, questions: object[], state: string, raw: object[]}[]}
+ */
+export function mapTimedQuestions(value) {
+  const view = value?.values?.userQuestions
+  const active = Array.isArray(view?.active) ? view.active : []
+  return active
+    .filter(question => question?.state === 'continued' && typeof question.callId === 'string')
+    .map(question => {
+      const raw = Array.isArray(question.questions) ? question.questions : []
+      return {
+        id: question.callId,
+        call_id: question.callId,
+        state: 'continued',
+        questions: raw.map(projectQuestion),
+        raw,
+      }
+    })
+}
+
+/**
+ * 读会话投影里的可补答问题。
+ * @param {object} options
+ * @param {{ call: Function }} options.client
+ * @param {string} options.sessionId
+ */
+export async function readTimedQuestions({ client, sessionId }) {
+  const value = await client.call('session/projections', { request: { sessionId } }, { timeoutMs: 15_000 })
+  return mapTimedQuestions(value)
+}
+
+/**
+ * 补答一个已经超时（`continued`）的 timed 提问。
+ *
+ * 这条路绕过 waterfall，直接调 `userQuestions.answer(agent, callId, answer)`：
+ * DSH 会把答案包成一条 `user-question-reply` 用户消息 steer 进会话，并据此结算投影。
+ *
+ * @param {object} options
+ * @param {{ call: Function, answerQuestion: Function }} options.client
+ * @param {string} options.sessionId
+ * @param {string} options.callId
+ * @param {unknown} options.answers 调用方提交的答案
+ */
+export async function answerTimedQuestion({ client, sessionId, callId, answers }) {
+  const pending = await readTimedQuestions({ client, sessionId })
+  const target = pending.find(question => question.call_id === callId)
+  if (target === undefined) {
+    throw new ApiError(409, 'conflict_error', 'question_not_pending',
+      `问题 ${callId} 不在等待答案（可能已回答、已撤销，或不属于该会话）`, { question_id: callId })
+  }
+  const value = normalizeAnswers(target.raw, answers)
+  const accepted = await client.answerQuestion({ sessionId, callId, answer: value })
+  if (accepted !== true) {
+    throw new ApiError(409, 'conflict_error', 'question_not_answerable',
+      `问题 ${callId} 已不能再接受答案（DSH 返回 false）`, { question_id: callId })
+  }
+  return { id: callId, session_id: sessionId, mode: 'late', answered_at: Math.floor(Date.now() / 1000) }
 }
 
 /**
@@ -185,18 +264,20 @@ export class QuestionBroker {
    * @param {string} options.sessionId 提问所属会话（= 线帧里的 agentId）
    * @param {{id: string, question: string}[]} options.questions
    * @param {string} [options.eventId] waterfall 事件 id，用于取消时对账
+   * @param {string} [options.callId] timed 模式下请求里带 `wait.callId`；有就用它当 id，
+   *   这样调用方在「窗口内」和「超时后补答」两个阶段用的是同一个标识
    * @returns {{promise: Promise<object|null>, id: string}}
    *   `promise` 解析为 `{answers:[...]}` 或 `null`（放行 / 超时 / 撤销）
    */
-  open({ sessionId, questions, eventId }) {
+  open({ sessionId, questions, eventId, callId }) {
     if (this.#closed) return { id: 'closed', promise: Promise.resolve(null) }
-    const id = `q_${randomUUID()}`
+    const id = typeof callId === 'string' && callId.length > 0 ? callId : `q_${randomUUID()}`
     const createdAt = Date.now()
     const expiresAt = createdAt + this.#waitMs
     let settle
     const promise = new Promise((resolve) => { settle = resolve })
     const entry = {
-      id, sessionId, questions, eventId, createdAt, expiresAt,
+      id, sessionId, questions, eventId, callId, createdAt, expiresAt,
       settled: false,
       settle: (value, reason) => {
         if (entry.settled) return false
@@ -312,7 +393,8 @@ export async function attachRemoteQuestions({ openEvents, replyEvent, broker, lo
       return
     }
     const questions = Array.isArray(frame.request?.questions) ? frame.request.questions : []
-    const waiter = broker.open({ sessionId: frame.agentId, questions, eventId: frame.eventId })
+    const callId = typeof frame.request?.wait?.callId === 'string' ? frame.request.wait.callId : undefined
+    const waiter = broker.open({ sessionId: frame.agentId, questions, eventId: frame.eventId, callId })
     const value = await waiter.promise
     try {
       await reply(frame.eventId, value === null ? { kind: 'next' } : { kind: 'result', value })
@@ -383,7 +465,8 @@ export function attachCordisQuestions({ ctx, broker, log, hold = true }) {
     const sessionId = request?.agent?.id
     const questions = Array.isArray(request?.questions) ? request.questions : []
     if (!hold || typeof sessionId !== 'string' || questions.length === 0) return next()
-    const waiter = broker.open({ sessionId, questions })
+    const callId = typeof request?.wait?.callId === 'string' ? request.wait.callId : undefined
+    const waiter = broker.open({ sessionId, questions, callId })
     const value = await waiter.promise
     return value === null ? next() : value
   }

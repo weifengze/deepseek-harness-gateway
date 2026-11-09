@@ -84,6 +84,27 @@ export class CordisDshClient {
   }
 
   /**
+   * 补答一个已经超时的 timed 提问。
+   *
+   * 进程内没有 Typert 的 SessionId→Agent 解析，只能自己从 `agents` 注册表取**精确那一份**
+   * ——`assertLiveRoot` 要求 `agents.get(agent.id) === agent`，拿错实例会抛 `CALLER_NOT_LIVE`。
+   * 会话没有活着 runtime（冷会话）时无法补答，这是 DSH 的语义，不是网关的限制。
+   *
+   * @param {{sessionId: string, callId: string, answer: {answers: object[]}}} request
+   */
+  async answerQuestion({ sessionId, callId, answer }) {
+    const service = this.#service('userQuestions')
+    const agents = this.#ctx.get('agents')
+    const agent = agents?.get?.(sessionId)
+    if (agent === undefined) {
+      throw new ApiError(409, 'conflict_error', 'agent_not_live',
+        `会话 ${sessionId} 没有活着的 runtime，无法补答；timed 补答只对正在运行的会话有效`,
+        { session_id: sessionId })
+    }
+    return service.answer(agent, callId, answer)
+  }
+
+  /**
    * 接管提问：在宿主进程内挂 `user-questions/request` 瀑布监听。
    *
    * 与 sidecar 模式的差别：这里拿到的是原始事件（含 `agent` 实例），不需要

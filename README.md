@@ -231,7 +231,7 @@ flowchart LR
 ### 4.1 `GET /healthz`（免鉴权）
 
 ```json
-{"status":"ok","version":"0.6.0",
+{"status":"ok","version":"0.7.0",
  "dsh":{"reachable":true,"presets":14,"base_url":"cordis:in-process"}}
 ```
 
@@ -467,11 +467,12 @@ Agent 答完往往还产出文件。0.5.0 起，**一轮的返回里带 `files`*
 
 ### 4.12 提问表单：替人回答 `ask_user_question`
 
-模型提问时，调用方可以像填表一样把答案提交回去。0.6.0 起支持（**legacy 形态**）：
+模型提问时，调用方可以像填表一样把答案提交回去。0.6.0 起支持 legacy，
+**0.7.0 起支持 timed（可超时后补答）**：
 
 | 路由 | 说明 |
 |---|---|
-| `GET /v1/sessions/{id}/questions` | 当前在等答案的表单 |
+| `GET /v1/sessions/{id}/questions` | 当前在等答案的表单；`state` 为 `open`（窗口内）或 `continued`（已超时、可补答） |
 | `POST /v1/sessions/{id}/questions/{question_id}/answer` | `{answers:[{id,selected,custom?}]}` 或 `{decline:true}` |
 
 `stream:true` 时 SSE 会多出 `question` / `question_closed` 两种帧；`stream:false` 的调用方
@@ -479,20 +480,23 @@ Agent 答完往往还产出文件。0.5.0 起，**一轮的返回里带 `files`*
 
 ```json
 // SSE
-{"type":"question","question_id":"q_3c4e...","questions":[
+{"type":"question","question_id":"call_00_...","questions":[
   {"id":"q1","question":"选 A 还是 B","header":"确认","options":[{"label":"A"},{"label":"B"}]}],
  "expires_at":1794197322}
 
 // 提交
 {"answers":[{"id":"q1","selected":["A"]}]}
+// → {"object":"question","mode":"late","answered_at":...}
 ```
 
 为什么非做不可：提问走的是**瀑布事件** `user-questions/request`，没人应答时 DSH 不会自己收尾，
 那一轮会一直挂着（实测 150 秒无响应）。网关现在订阅 `$events` 承接它——所以
 `questions.enabled:false` 也不是「关掉通道」，而是「收到就放行」，保证回合能结束。
 
-legacy 的三个后果：答案只在网关进程内存、没有 `callId` 不能事后补交、超过 `questions.waitMs` 按放行处理。
-完整语义、与浏览器界面抢答的竞态、错误码见 [`docs/questions.md`](docs/questions.md)。
+两种形态用**同一个 URL、同一个 id**：timed 的 `callId` 直接当 `question_id`，所以窗口内提交
+（`mode:"live"`）和超时后补答（`mode:"late"`，走 `userQuestions/answer`）调用方不用区分。
+legacy 没有 `callId`，答案只在网关进程内存里，超过 `questions.waitMs` 就按放行处理。
+完整语义、如何开启 timed、与浏览器界面抢答的竞态、错误码见 [`docs/questions.md`](docs/questions.md)。
 
 ---
 
@@ -868,9 +872,12 @@ DSH_BASE_URL=http://127.0.0.1:3080 DSH_API_TOKEN=xxxx dsh-gateway
 9. **异步 run 结果在内存**：1 小时 TTL，重启丢失（含其中的 `files`）。
 10. **模型绑定会写部署默认**：`selectModel` 的既有语义，会话内不受影响（见 2.5）。
 11. **`has_more` 恒为 false**：历史一次性取最近 N 条，没有游标分页。
-12. **提问只支持 legacy 形态**：答案必须落在 `questions.waitMs` 窗口内，且只在网关进程内存里；
-    进程重启即丢失。timed 形态（可事后补答）未实现，见 [`docs/questions.md`](docs/questions.md)。
-13. **浏览器会抢答**：同一实例开着浏览器界面时，`user-questions/request` 可能被浏览器接管，
+12. **提问的 legacy 形态有窗口限制**：没有 `callId`，答案只在网关进程内存里、必须落在
+    `questions.waitMs` 内；重启即丢失。要能事后补答就把 preset 的 `tool-ask-user` 改成
+    `mode: timed`（见 [`docs/questions.md`](docs/questions.md) 3.3）。
+13. **timed 补答要求会话活着**：插件模式下 `agents.get(sessionId)` 拿不到活 Agent 时返回
+    409 `agent_not_live`；sidecar 模式由 DSH 自己解析，冷会话同样不可补答。
+14. **浏览器会抢答**：同一实例开着浏览器界面时，`user-questions/request` 可能被浏览器接管，
     此时 API 侧的 `GET /questions` 一直为空。要么别同实例开浏览器，要么把它当人工兜底。
 
 **路线图**

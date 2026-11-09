@@ -13,6 +13,36 @@
 
 ---
 
+## [0.7.0] — 2026-11-09
+
+### Added
+
+- **timed 形态的提问**：模型给 `ask_user_question` 传 `timeout` 后，超时不再失败，
+  而是返回 `pending`，问题留在会话投影里等补答。网关两条路都接：
+  - 窗口内：`POST .../answer` → `mode: "live"`（回 waterfall）
+  - 超时后：`POST .../answer` → `mode: "late"`（走 `userQuestions/answer`，答案作为
+    `user-question-reply` 用户消息 steer 回会话，DSH 接着跑一轮）
+- `GET /questions` 现在合并两处来源：网关内存里的表单（`state: "open"`）与
+  会话投影里的待答问题（`state: "continued"`，带 `can_answer_late: true`）。
+- timed 模式下 `callId` 直接作为 `question_id`，窗口内外用同一个标识，调用方不必映射。
+
+### Changed
+
+- `POST .../answer` 的响应新增 `mode` 字段（`live` / `late`）。
+
+### Fixed
+
+- 补答路径的线级参数名按生成代码核对：`userQuestions/answer(agentId, callId, answer)`，
+  返回布尔。实测传假 callId 得到 `{"ok":true,"value":false}`，参数名错会是 400。
+
+### Known limitations
+
+- timed 需要 DSH 侧把 preset 的 `tool-ask-user` 配成 `mode: timed`（默认是 legacy）。
+  注意 patch 的 `config` 是**整体替换**，必须带全 `id` / `order` / `plugins`。
+- 补答要求会话活着：插件模式取不到活 Agent 时返回 409 `agent_not_live`。
+
+---
+
 ## [0.6.0] — 2026-11-09
 
 ### Added
@@ -115,7 +145,8 @@
 
 ---
 
-[Unreleased]: https://github.com/weifengze/deepseek-harness-gateway/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/weifengze/deepseek-harness-gateway/compare/v0.7.0...HEAD
+[0.7.0]: https://www.npmjs.com/package/deepseek-harness-gateway/v/0.7.0
 [0.6.0]: https://www.npmjs.com/package/deepseek-harness-gateway/v/0.6.0
 [0.5.0]: https://www.npmjs.com/package/deepseek-harness-gateway/v/0.5.0
 [0.4.2]: https://www.npmjs.com/package/deepseek-harness-gateway/v/0.4.2

@@ -441,6 +441,18 @@ export class DshClient {
   }
 
   /**
+   * 补答一个已经超时的 timed 提问（`userQuestions/answer`）。
+   *
+   * 线上第一个参数是 **SessionId**（生成代码里叫 `agentId`），由 Host 解析成活着的 Agent。
+   * 返回 `true` 表示答案已入队；`false` 表示那个 callId 已不再是 `continued` 状态。
+   *
+   * @param {{sessionId: string, callId: string, answer: {answers: object[]}}} request
+   */
+  async answerQuestion({ sessionId, callId, answer }) {
+    return this.call('userQuestions/answer', { agentId: sessionId, callId, answer }, { timeoutMs: 20_000 })
+  }
+
+  /**
    * 接管提问：订阅 `$events`，把 `user-questions/request` 变成本进程里的待答表单。
    * @param {import('./questions.mjs').QuestionBroker} broker
    * @param {(level: string, message: string, extra?: object) => void} [log]
